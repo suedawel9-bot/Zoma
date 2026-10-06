@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-07 — realistic bot names + welcome bonus
+// Updated: 2026-10-07 — bot names + 3s global winner popup
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-07");
@@ -32,21 +32,18 @@ const MAX_CARDS_PER_PLAYER = 4;
 const MIN_PLAYERS_TO_START = 2;
 const LOBBY_COUNTDOWN = Number(process.env.ROUND_COUNTDOWN || 30);
 const CALL_INTERVAL_MS = Number(process.env.CALL_INTERVAL_MS || 3500);
-const WINNER_POPUP_SECONDS = Number(process.env.WINNER_POPUP_SECONDS || 4);
+const WINNER_POPUP_SECONDS = Number(process.env.WINNER_POPUP_SECONDS || 3); // ← 3s default
 
-// ✨ Welcome bonus for brand-new human users
 const WELCOME_BONUS = Number(process.env.WELCOME_BONUS || 100);
 
-// 🤖 Bots
 const BOT_COUNT = Number(process.env.BOT_COUNT || 100);
 const BOT_BALANCE = Number(process.env.BOT_BALANCE || 10000);
 
-// Telebirr receiving account
 const TB_NUMBER = process.env.TB_NUMBER || "0911-000-000";
 const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 
 // ============================================================
-// REALISTIC BOT NAMES (Ethiopian + international mix)
+// REALISTIC BOT NAMES
 // ============================================================
 
 const FIRST_NAMES = [
@@ -72,7 +69,6 @@ const LAST_INITIALS = [
 ];
 
 function pickBotName(i) {
-  // Deterministic so bot N always gets the same name across restarts.
   const first = FIRST_NAMES[i % FIRST_NAMES.length];
   const last = LAST_INITIALS[Math.floor(i / FIRST_NAMES.length) % LAST_INITIALS.length];
   return `${first} ${last}.`;
@@ -281,7 +277,7 @@ async function initDatabase() {
 }
 
 // ============================================================
-// BOT SEEDING — 100 named bots, each with 10000 birr
+// BOT SEEDING
 // ============================================================
 
 const BOT_ID_BASE = 9000000000000;
@@ -310,7 +306,7 @@ async function seedBots() {
 }
 
 // ============================================================
-// CARD LOGIC (mirrors public/cards.js)
+// CARD LOGIC
 // ============================================================
 
 function seeded(a) {
@@ -417,6 +413,16 @@ function sendState() {
   }
 }
 
+// Broadcast a one-shot winner popup to EVERY connected player
+function broadcastWinnerPopup(payload) {
+  const msg = JSON.stringify({ type: "winner_popup", ...payload });
+  for (const ws of wss.clients) {
+    if (ws.readyState === 1) {
+      try { ws.send(msg); } catch {}
+    }
+  }
+}
+
 // ============================================================
 // GAME LOOP
 // ============================================================
@@ -451,7 +457,6 @@ function startCountdown() {
   }, 1000);
 }
 
-// Every bot joins every round with 1–2 random unused cards, using a real name.
 function addBots() {
   game.bots = [];
   const usedCards = new Set(game.cards.keys());
@@ -461,7 +466,7 @@ function addBots() {
     const botName = pickBotName(i);
     const botCards = [];
 
-    const nCards = 1 + Math.floor(Math.random() * 2); // 1 or 2 cards
+    const nCards = 1 + Math.floor(Math.random() * 2);
     for (let k = 0; k < nCards; k++) {
       let n;
       let guard = 0;
@@ -583,8 +588,35 @@ async function finishRound(winner) {
         console.error("payout:", err);
       }
     }
+
+    // 🏆 Broadcast winner popup to EVERY connected player
+    broadcastWinnerPopup({
+      names: winner.names,
+      cardNo: winner.card,
+      prize,
+      isBot: !winner.tgId,
+      card: cardFor(winner.card),
+      drawn: game.drawn,
+      duration: WINNER_POPUP_SECONDS * 1000
+    });
+
+    console.log(
+      `🏆 Winner: ${winner.names.join(", ")} | card #${winner.card} | prize ${prize} birr`
+    );
   } else {
     game.winner = null;
+
+    broadcastWinnerPopup({
+      names: null,
+      cardNo: null,
+      prize: 0,
+      isBot: false,
+      card: null,
+      drawn: game.drawn,
+      duration: WINNER_POPUP_SECONDS * 1000
+    });
+
+    console.log("🏁 No winner this round");
   }
 
   try {
@@ -869,7 +901,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🎱 Zoma Bingo on :${PORT}`);
   console.log(`💵 CARD_PRICE=${CARD_PRICE}  🏆 HOUSE_CUT=${HOUSE_CUT}`);
   console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}  💰 BOT_BALANCE=${BOT_BALANCE}`);
-  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr`);
+  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr  🏆 POPUP=${WINNER_POPUP_SECONDS}s`);
 
   try {
     await initDatabase();
@@ -880,10 +912,6 @@ server.listen(PORT, "0.0.0.0", async () => {
     console.error("❌ Startup error:", err);
   }
 });
-
-// ============================================================
-// SHUTDOWN
-// ============================================================
 
 async function shutdown(sig) {
   console.log(`🛑 ${sig}`);
