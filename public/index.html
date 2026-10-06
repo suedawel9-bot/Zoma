@@ -47,6 +47,15 @@ box-shadow:0 8px 0 rgba(0,0,0,.25)}
 .cta{width:100%;margin-top:12px;font-size:20px;padding:14px}
 .cta.go{background:var(--G)}
 .msg{margin:10px 0 0;min-height:22px;color:var(--N);font-weight:800}
+.winner-pop{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}
+.winner-pop[hidden]{display:none}
+.winner-box{width:min(92vw,390px);background:var(--panel);border-radius:24px;padding:24px 18px;text-align:center;box-shadow:0 18px 60px rgba(0,0,0,.55);animation:wpop .35s ease-out}
+.winner-trophy{font-size:58px;line-height:1;margin-bottom:6px}
+.winner-title{font-size:28px;font-weight:800;color:var(--N)}
+.winner-name{font-size:24px;font-weight:800;margin-top:4px;word-break:break-word}
+.winner-card{font-size:18px;margin-top:4px;color:var(--mute)}
+.winner-prize{font-size:26px;font-weight:800;color:#5be3a3;margin-top:10px}
+@keyframes wpop{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
 dialog{border:0;border-radius:20px;background:var(--panel);color:var(--ink);width:min(92vw,380px);padding:18px}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 label{display:block;margin:10px 0 4px;color:var(--mute)}
@@ -71,6 +80,15 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 #join{position:sticky;bottom:calc(74px + env(safe-area-inset-bottom));z-index:5;box-shadow:0 6px 18px rgba(0,0,0,.45)}
 </style></head>
 <body>
+<div id="winnerPop" class="winner-pop" hidden>
+  <div class="winner-box">
+    <div class="winner-trophy">🏆</div>
+    <div class="winner-title">BINGO WINNER!</div>
+    <div class="winner-name" id="winnerPopName"></div>
+    <div class="winner-card" id="winnerPopCard"></div>
+    <div class="winner-prize" id="winnerPopPrize"></div>
+  </div>
+</div>
 <div class="top">
   <div class="bal"><small>Balance</small><span id="bal">–</span> birr</div>
   
@@ -121,6 +139,7 @@ const COL = ["B","I","N","G","O"], CC = ["--B","--I","--N","--G","--O"];
 const colorOf = (n) => `var(${CC[Math.min(4, Math.floor((n - 1) / 15))]})`;
 const letterOf = (n) => COL[Math.min(4, Math.floor((n - 1) / 15))];
 let ws, S = null, marks = new Set(), cardKey = "", lastDrawn = 0, info = {};
+let lastWinnerKey = "", winnerTimer = null;
 
 const api = async (path, body) => {
   const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", "x-init": tg.initData }, body: body && JSON.stringify(body) });
@@ -150,6 +169,19 @@ const line = (c, d) => {
 };
 const heads = () => COL.map((l, i) => `<div class="h" style="background:var(${CC[i]})">${l}</div>`).join("");
 const cells = (card, d) => card.flat().map((n) => `<div class="c ${n === 0 ? "free" : d && d.includes(n) ? "mk" : ""}">${n || "FREE"}</div>`).join("");
+function showWinnerPopup(w) {
+  if (!w) return;
+  const names = Array.isArray(w.names) ? w.names : [];
+  const name = w.you ? "You" : (names.length ? names.join(", ") : "Winner");
+  const cardNo = w.card ?? w.cardNo ?? w.no ?? "";
+  $("winnerPopName").textContent = name;
+  $("winnerPopCard").textContent = cardNo ? `Card #${cardNo}` : "";
+  $("winnerPopPrize").textContent = `${w.prize ?? 0} birr`;
+  $("winnerPop").hidden = false;
+  clearTimeout(winnerTimer);
+  winnerTimer = setTimeout(() => { $("winnerPop").hidden = true; }, 3000);
+}
+
 function render() {
   const s = S, d = s.drawn, last = d[d.length - 1], ball = $("ball");
   if (last) {
@@ -163,7 +195,21 @@ function render() {
   else if (s.phase === "playing") { st.textContent = "Numbers are being called"; sub.textContent = `${d.length} called · ${info}`; }
   else { st.textContent = "Round over"; sub.textContent = "Next round starts soon"; }
   $("win").hidden = !s.winner;
-  if (s.winner) $("win").textContent = s.winner.you ? `You won ${s.winner.prize} birr 🎉` : `${s.winner.names.join(", ")} won ${s.winner.prize} birr`;
+  if (s.winner) {
+    $("win").textContent = s.winner.you ? `You won ${s.winner.prize} birr 🎉` : `${s.winner.names.join(", ")} won ${s.winner.prize} birr`;
+    const winnerKey = JSON.stringify({
+      names: s.winner.names || [],
+      you: !!s.winner.you,
+      prize: s.winner.prize,
+      card: s.winner.card ?? s.winner.cardNo ?? s.winner.no
+    });
+    if (winnerKey !== lastWinnerKey) {
+      lastWinnerKey = winnerKey;
+      showWinnerPopup(s.winner);
+    }
+  } else {
+    lastWinnerKey = "";
+  }
   const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
   $("pick").hidden = !canBuy; if (canBuy) drawPicker();
   $("play").hidden = !own;
