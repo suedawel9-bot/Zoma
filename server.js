@@ -1,8 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-07
-//  - Welcome 100 birr for new users
-//  - 100 bots every round, each with 10,000 birr balance
+// Updated: 2026-10-07 — welcome bonus + 100 bots with 10000 birr
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-07");
@@ -31,16 +29,17 @@ const CARD_PRICE = Number(process.env.CARD_PRICE || 10);
 const HOUSE_CUT = Number(process.env.HOUSE_CUT || 0);
 const TOTAL_CARDS = 500;
 const MAX_CARDS_PER_PLAYER = 4;
-const MIN_HUMANS_TO_START = 1;          // at least 1 real player to start (bots fill the rest)
+const MIN_PLAYERS_TO_START = 2;
 const LOBBY_COUNTDOWN = Number(process.env.ROUND_COUNTDOWN || 30);
 const CALL_INTERVAL_MS = Number(process.env.CALL_INTERVAL_MS || 3500);
 const WINNER_POPUP_SECONDS = Number(process.env.WINNER_POPUP_SECONDS || 4);
 
-// ✨ NEW
+// ✨ Welcome bonus for brand-new human users
 const WELCOME_BONUS = Number(process.env.WELCOME_BONUS || 100);
-const BOT_COUNT = Number(process.env.BOT_COUNT || 100);
-const BOT_START_BALANCE = Number(process.env.BOT_START_BALANCE || 10000);
-const BOT_MAX_CARDS_PER_ROUND = Number(process.env.BOT_MAX_CARDS_PER_ROUND || 4);
+
+// 🤖 Bots
+const BOT_COUNT = Number(process.env.BOT_COUNT || 100);            // how many bots join each round
+const BOT_BALANCE = Number(process.env.BOT_BALANCE || 10000);      // each bot's starting balance
 
 // Telebirr receiving account
 const TB_NUMBER = process.env.TB_NUMBER || "0911-000-000";
@@ -94,7 +93,7 @@ function extractInitData(req) {
 }
 
 // ============================================================
-// ENSURE USER — welcome bonus for new users
+// ENSURE USER — welcome bonus for brand-new humans
 // ============================================================
 
 async function ensureUser(tgUser) {
@@ -140,9 +139,7 @@ async function ensureUser(tgUser) {
   }
 
   console.log(
-    `🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id} (${
-      tgUser.first_name || tgUser.username || "new"
-    })`
+    `🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id} (${tgUser.first_name || tgUser.username || "new"})`
   );
 
   return { isNew: true, balance: Number(inserted.rows[0].balance) };
@@ -155,7 +152,8 @@ async function authMiddleware(req, res, next) {
       return res.status(401).json({ error: "Invalid Telegram Mini App authentication" });
     }
     req.tgUser = tgUser;
-    await ensureUser(tgUser);
+    const { isNew } = await ensureUser(tgUser);
+    req.isNewUser = isNew;
     next();
   } catch (err) {
     console.error("auth middleware:", err);
@@ -180,6 +178,10 @@ const apiLimiter = rateLimit({
   legacyHeaders: false
 });
 app.use("/api", apiLimiter);
+
+// ============================================================
+// HTTP + WS
+// ============================================================
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -215,7 +217,6 @@ async function initDatabase() {
     );
   `);
 
-  // Safety: add is_bot column if it's missing (migration)
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;
   `);
@@ -251,40 +252,33 @@ async function initDatabase() {
 }
 
 // ============================================================
-// BOTS — persistent in DB, 10000 birr each
+// BOT SEEDING — 100 bots each with 10000 birr, every round
 // ============================================================
 
-// Bot telegram_ids are negative so they never collide with real users.
-// Real Telegram IDs are positive; we use -(i+1).
-function botTelegramId(i) {
-  return -(i + 1);
-}
+// Bot IDs live in a reserved range so they never collide with real Telegram users.
+// Telegram user IDs are 32-bit ints, so we start at 9,000,000,000,000 (way above).
+const BOT_ID_BASE = 9000000000000;
 
-async function ensureBots() {
-  // Create/refresh all bots in DB with at least BOT_START_BALANCE
+async function seedBots() {
+  console.log(`🤖 Seeding ${BOT_COUNT} bots with ${BOT_BALANCE} birr each…`);
+
   for (let i = 0; i < BOT_COUNT; i++) {
-    const tgId = botTelegramId(i);
+    const botId = BOT_ID_BASE + i;
+    const botName = `Bot ${i + 1}`;
     await pool.query(
-      `INSERT INTO users (telegram_id, username, first_name, last_name, balance, is_bot)
-       VALUES ($1, $2, $3, $4, $5, TRUE)
-       ON CONFLICT (telegram_id) DO UPDATE SET
-         is_bot = TRUE,
-         first_name = EXCLUDED.first_name,
-         updated_at = NOW()`,
-      [
-        tgId,
-        `bot_${i + 1}`,
-        `Bot ${i + 1}`,
-        null,
-        BOT_START_BALANCE
-      ]
+      `INSERT INTO users (telegram_id, username, first_name, balance, is_bot)
+       VALUES ($1, $2, $3, $4, TRUE)
+       ON CONFLICT (telegram_id)
+       DO UPDATE SET balance = $4, first_name = $3, is_bot = TRUE, updated_at = NOW()`,
+      [botId, null, botName, BOT_BALANCE]
     );
   }
-  console.log(`🤖 ${BOT_COUNT} bots ready (each starts with ${BOT_START_BALANCE} birr)`);
+
+  console.log(`✅ ${BOT_COUNT} bots ready (each ${BOT_BALANCE} birr)`);
 }
 
 // ============================================================
-// CARD LOGIC
+// CARD LOGIC (mirrors public/cards.js)
 // ============================================================
 
 function seeded(a) {
@@ -335,9 +329,9 @@ const game = {
   drawn: [],
   drawnSet: new Set(),
   prize: 0,
-  players: new Map(),      // human players only: tgId -> { names }
-  cards: new Map(),        // cardNo -> owner ("user:tgId" | "bot:i")
-  bots: [],                // [{ i, names, cards }]
+  players: new Map(),       // tgId -> { names, isBot }
+  cards: new Map(),         // cardNo -> owner (tgId number or 'bot:ID')
+  bots: [],                 // [{ id, names, cards }] for the current round
   winner: null,
   lobbyTimer: null,
   callTimer: null,
@@ -348,24 +342,10 @@ function drawnPrize() {
   return Math.max(0, Math.floor(game.cards.size * CARD_PRICE * (1 - HOUSE_CUT)));
 }
 
-function ownerKind(owner) {
-  if (typeof owner === "string" && owner.startsWith("bot:")) {
-    const idx = Number(owner.slice(4));
-    return { kind: "bot", index: idx };
-  }
-  if (typeof owner === "string" && owner.startsWith("user:")) {
-    const id = Number(owner.slice(5));
-    return { kind: "user", tgId: id };
-  }
-  // Fallback: raw numeric tgId (from older code path)
-  return { kind: "user", tgId: Number(owner) };
-}
-
 function publicState(forTgId) {
   const cardsForUser = [];
   for (const [cardNo, owner] of game.cards) {
-    const info = ownerKind(owner);
-    if (info.kind === "user" && info.tgId === forTgId) {
+    if (owner === forTgId) {
       cardsForUser.push({ no: cardNo, card: cardFor(cardNo) });
     }
   }
@@ -387,7 +367,7 @@ function publicState(forTgId) {
     countdown: game.countdown,
     drawn: game.drawn,
     prize: drawnPrize(),
-    players: game.players.size,
+    players: [...game.players.values()].filter((p) => !p.isBot).length,
     bots: game.bots.length,
     taken,
     max: MAX_CARDS_PER_PLAYER,
@@ -439,17 +419,17 @@ function startCountdown() {
   }, 1000);
 }
 
-// 100 bots — each takes 1 to 4 random cards and pays from their balance
-async function addBotsAndBuyCards() {
+// Every bot joins every round with 1–2 random unused cards.
+function addBots() {
   game.bots = [];
   const usedCards = new Set(game.cards.keys());
 
   for (let i = 0; i < BOT_COUNT; i++) {
-    const tgId = botTelegramId(i);
+    const botTgId = BOT_ID_BASE + i;
+    const botName = `Bot ${i + 1}`;
     const botCards = [];
 
-    const nCards = 1 + Math.floor(Math.random() * BOT_MAX_CARDS_PER_ROUND);
-
+    const nCards = 1 + Math.floor(Math.random() * 2); // 1 or 2 cards
     for (let k = 0; k < nCards; k++) {
       let n;
       let guard = 0;
@@ -457,50 +437,21 @@ async function addBotsAndBuyCards() {
         n = 1 + Math.floor(Math.random() * TOTAL_CARDS);
         guard++;
       } while (usedCards.has(n) && guard < 5000);
-      if (usedCards.has(n)) continue;
+
+      if (usedCards.has(n)) continue; // pool exhausted (500 cards all taken)
       usedCards.add(n);
       botCards.push(n);
-      game.cards.set(n, `bot:${i}`);
+      game.cards.set(n, botTgId);
     }
 
-    if (botCards.length) {
-      // Charge the bot's balance in DB
-      const cost = botCards.length * CARD_PRICE;
-      try {
-        await pool.query(
-          `UPDATE users SET balance = GREATEST(balance - $1, 0), updated_at = NOW()
-           WHERE telegram_id = $2`,
-          [cost, tgId]
-        );
-        await pool.query(
-          `INSERT INTO transactions (telegram_id, type, amount, status)
-           VALUES ($1, 'bot_card', $2, 'completed')`,
-          [tgId, cost]
-        );
-      } catch (err) {
-        console.error("bot charge:", err);
-      }
-    }
-
-    game.bots.push({
-      i,
-      names: [`Bot ${i + 1}`],
-      cards: botCards
-    });
+    game.bots.push({ id: i, tgId: botTgId, names: [botName], cards: botCards });
   }
 }
 
 async function startRound() {
   if (game.phase === "playing" || game.phase === "over") return;
 
-  // Needs at least 1 human player
-  if (game.players.size < MIN_HUMANS_TO_START) {
-    startLobby();
-    return;
-  }
-
-  await addBotsAndBuyCards();
-
+  addBots();
   game.phase = "playing";
   game.countdown = null;
   sendState();
@@ -541,21 +492,16 @@ function findWinner() {
   for (const [cardNo, owner] of game.cards) {
     const card = cardFor(cardNo);
     if (hasLine(card, game.drawnSet)) {
-      const info = ownerKind(owner);
-      let names;
-      let tgId = null;
-
-      if (info.kind === "bot") {
-        const bot = game.bots.find((b) => b.i === info.index);
-        names = bot ? bot.names : [`Bot ${info.index + 1}`];
-        tgId = botTelegramId(info.index);
+      // owner is either a bot tgId (number >= BOT_ID_BASE) or a human tgId
+      const ownerNum = typeof owner === "number" ? owner : Number(owner);
+      if (ownerNum >= BOT_ID_BASE) {
+        const idx = ownerNum - BOT_ID_BASE;
+        const bot = game.bots.find((b) => b.id === idx);
+        return { names: bot ? bot.names : [`Bot ${idx + 1}`], card: cardNo, tgId: null };
       } else {
-        const p = game.players.get(info.tgId);
-        names = p ? p.names : ["Player"];
-        tgId = info.tgId;
+        const p = game.players.get(ownerNum);
+        return { names: p ? p.names : ["Player"], card: cardNo, tgId: ownerNum };
       }
-
-      return { names, card: cardNo, tgId, isBot: info.kind === "bot" };
     }
   }
   return null;
@@ -576,7 +522,7 @@ async function finishRound(winner) {
       tgId: winner.tgId
     };
 
-    // Credit the prize to whoever won — human OR bot
+    // Only pay humans; bots don't need real balance updates for display purposes.
     if (winner.tgId) {
       try {
         const client = await pool.connect();
@@ -598,17 +544,9 @@ async function finishRound(winner) {
           client.release();
         }
 
-        // Push live balance update to a human winner
-        if (!winner.isBot) {
-          for (const ws of wss.clients) {
-            if (ws.tgId === winner.tgId) {
-              try {
-                ws.send(JSON.stringify({
-                  type: "balance",
-                  balance: await getBalance(winner.tgId)
-                }));
-              } catch {}
-            }
+        for (const ws of wss.clients) {
+          if (ws.tgId === winner.tgId) {
+            try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(winner.tgId) })); } catch {}
           }
         }
       } catch (err) {
@@ -658,7 +596,6 @@ wss.on("connection", (ws) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // --- AUTH ---
     if (msg.type === "auth") {
       const tg = validateInitData(msg.initData);
       if (!tg) {
@@ -666,39 +603,34 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // Ensure user row exists (welcome bonus on first sight)
-      let bal;
-      try {
-        const r = await ensureUser(tg);
-        bal = r.balance;
-      } catch (err) {
-        console.error("ensureUser (ws):", err);
-        try { ws.send(JSON.stringify({ type: "error", msg: "Database error" })); } catch {}
+      // Block bot IDs from authenticating as humans
+      if (Number(tg.id) >= BOT_ID_BASE) {
+        try { ws.send(JSON.stringify({ type: "error", msg: "Invalid user" })); } catch {}
         return;
       }
 
       ws.tgId = tg.id;
 
-      const name =
-        [tg.first_name, tg.last_name].filter(Boolean).join(" ") ||
-        tg.username ||
-        `Player ${String(tg.id).slice(-4)}`;
-
+      const { isNew, balance } = await ensureUser(tg);
+      const names = [tg.first_name, tg.last_name].filter(Boolean).join(" ") || tg.username || `Player ${String(tg.id).slice(-4)}`;
       if (!game.players.has(tg.id)) {
-        game.players.set(tg.id, { names: [name], tg });
+        game.players.set(tg.id, { names: [names], isBot: false });
       }
 
-      try { ws.send(JSON.stringify({ type: "balance", balance: bal })); } catch {}
+      try { ws.send(JSON.stringify({ type: "balance", balance })); } catch {}
       try { ws.send(JSON.stringify(publicState(tg.id))); } catch {}
 
-      // If the lobby is idle but has at least 1 human, start the countdown
-      if (game.phase === "lobby" && !game.lobbyTimer && game.players.size >= MIN_HUMANS_TO_START) {
+      if (isNew) {
+        try { ws.send(JSON.stringify({ type: "error", msg: `🎁 Welcome! You got ${WELCOME_BONUS} birr free.` })); } catch {}
+      }
+
+      // Start the countdown once at least one human has arrived (bots fill the rest).
+      if (game.phase === "lobby" && !game.lobbyTimer && game.players.size >= 1) {
         startCountdown();
       }
       return;
     }
 
-    // --- JOIN (buy specific cards) ---
     if (msg.type === "join") {
       if (!ws.tgId) {
         try { ws.send(JSON.stringify({ type: "error", msg: "Not authenticated" })); } catch {}
@@ -710,11 +642,13 @@ wss.on("connection", (ws) => {
       }
 
       const requested = Array.isArray(msg.cards) ? msg.cards : [];
-      const owned = [];
-      for (const [n, owner] of game.cards) {
-        const info = ownerKind(owner);
-        if (info.kind === "user" && info.tgId === ws.tgId) owned.push(n);
+      const player = game.players.get(ws.tgId);
+      if (!player) {
+        try { ws.send(JSON.stringify({ type: "error", msg: "Not registered" })); } catch {}
+        return;
       }
+
+      const owned = [...game.cards.entries()].filter(([, o]) => o === ws.tgId).map(([n]) => n);
       const room = MAX_CARDS_PER_PLAYER - owned.length;
 
       const valid = [];
@@ -766,12 +700,12 @@ wss.on("connection", (ws) => {
         client.release();
       }
 
-      for (const n of take) game.cards.set(n, `user:${ws.tgId}`);
+      for (const n of take) game.cards.set(n, ws.tgId);
 
       try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
       sendState();
 
-      if (!game.lobbyTimer && game.phase === "lobby" && game.players.size >= MIN_HUMANS_TO_START) {
+      if (!game.lobbyTimer && game.phase === "lobby" && game.cards.size > 0) {
         startCountdown();
       }
       return;
@@ -783,7 +717,7 @@ wss.on("connection", (ws) => {
 });
 
 // ============================================================
-// REST
+// REST: /api/me, /api/deposit, /api/withdraw
 // ============================================================
 
 app.get("/api/me", authMiddleware, async (req, res) => {
@@ -820,11 +754,13 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
     if (dupe.rows.length) {
       return res.status(400).json({ error: "This transaction ID was already used" });
     }
+
     await pool.query(
       `INSERT INTO transactions (telegram_id, type, amount, status, tx_id)
        VALUES ($1, 'deposit', $2, 'pending', $3)`,
       [req.tgUser.id, amount, txId]
     );
+
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -851,10 +787,12 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
       [req.tgUser.id]
     );
     const bal = Number(u.rows[0]?.balance || 0);
+
     if (bal < amount) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Insufficient balance" });
     }
+
     await client.query(
       `UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE telegram_id = $2`,
       [amount, req.tgUser.id]
@@ -864,6 +802,7 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
        VALUES ($1, 'withdraw', $2, 'pending', $3)`,
       [req.tgUser.id, amount, phone]
     );
+
     await client.query("COMMIT");
     const newBal = await getBalance(req.tgUser.id);
     res.json({ balance: newBal });
@@ -876,24 +815,19 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
   }
 });
 
+// ============================================================
+// HEALTH + FALLBACK
+// ============================================================
+
 app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({
-      ok: true,
-      db: "connected",
-      botToken: !!BOT_TOKEN,
-      game: game.phase,
-      humans: game.players.size,
-      bots: game.bots.length,
-      cards: game.cards.size
-    });
+    res.json({ ok: true, db: "connected", botToken: !!BOT_TOKEN, game: game.phase, bots: BOT_COUNT });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// SPA fallback
 app.use((req, res, next) => {
   if (req.path.startsWith("/api") || req.path.startsWith("/ws")) return next();
   res.sendFile(path.join(__dirname, "public", "index.html"));
@@ -906,17 +840,16 @@ app.use((req, res, next) => {
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🎱 Zoma Bingo on :${PORT}`);
   console.log(`💵 CARD_PRICE=${CARD_PRICE}  🏆 HOUSE_CUT=${HOUSE_CUT}`);
-  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS}`);
-  console.log(`🤖 BOT_COUNT=${BOT_COUNT}  💰 BOT_START_BALANCE=${BOT_START_BALANCE}`);
-  console.log(`👥 MIN_HUMANS_TO_START=${MIN_HUMANS_TO_START}`);
+  console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}  💰 BOT_BALANCE=${BOT_BALANCE}`);
+  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr`);
 
   try {
     await initDatabase();
-    await ensureBots();
     console.log("✅ Database ready");
+    await seedBots();
     startLobby();
   } catch (err) {
-    console.error("❌ Boot failed:", err);
+    console.error("❌ Startup error:", err);
   }
 });
 
