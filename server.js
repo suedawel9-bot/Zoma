@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-07 — welcome bonus + 100 bots with 10000 birr
+// Updated: 2026-10-07 — realistic bot names + welcome bonus
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-07");
@@ -38,12 +38,45 @@ const WINNER_POPUP_SECONDS = Number(process.env.WINNER_POPUP_SECONDS || 4);
 const WELCOME_BONUS = Number(process.env.WELCOME_BONUS || 100);
 
 // 🤖 Bots
-const BOT_COUNT = Number(process.env.BOT_COUNT || 100);            // how many bots join each round
-const BOT_BALANCE = Number(process.env.BOT_BALANCE || 10000);      // each bot's starting balance
+const BOT_COUNT = Number(process.env.BOT_COUNT || 100);
+const BOT_BALANCE = Number(process.env.BOT_BALANCE || 10000);
 
 // Telebirr receiving account
 const TB_NUMBER = process.env.TB_NUMBER || "0911-000-000";
 const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
+
+// ============================================================
+// REALISTIC BOT NAMES (Ethiopian + international mix)
+// ============================================================
+
+const FIRST_NAMES = [
+  "Abebe", "Sara", "Dawit", "Hanna", "Yonas", "Marta", "Bereket", "Selam",
+  "Kebede", "Meron", "Tesfaye", "Rahel", "Girma", "Liya", "Samuel", "Bethel",
+  "Nahom", "Eden", "Mikias", "Tsion", "Eyob", "Feven", "Natnael", "Beza",
+  "Henok", "Mimi", "Kaleab", "Rediet", "Biruk", "Selamawit", "Firaol", "Sofia",
+  "Dagmawi", "Mahlet", "Yosef", "Ruth", "Solomon", "Genet", "Amanuel", "Hiwot",
+  "Binyam", "Tigist", "Ermias", "Aster", "Biniam", "Almaz", "Temesgen", "Zewditu",
+  "Daniel", "Kidist", "Elias", "Helen", "Getachew", "Meseret", "Mulugeta", "Saba",
+  "Tewodros", "Bethlehem", "Abraham", "Yeshi", "Yohannes", "Tsehay", "Fikru", "Alem",
+  "Tadesse", "Fikirte", "Alemayehu", "Aynalem", "Dereje", "Sindu", "Bekele", "Wubit",
+  "Ayele", "Emebet", "Habtamu", "Tizita", "Endale", "Bezawit", "Chala", "Mulu",
+  "Guta", "Eyerusalem", "Lemma", "Ebisa", "Kenenisa", "Beamlak", "Tolosa", "Derartu",
+  "Haile", "Almitu", "Mekonnen", "Chaltu", "Wondimu", "Bontu", "Gadisa", "Ejigayehu",
+  "Obsa", "Rukiya", "Tariku", "Feyisa", "Lelisa", "Senay", "Mosisa", "Firaol",
+  "Gemechu", "Kuulani", "Robel", "Nardos", "Abdi", "Iman", "Mustafa", "Halima"
+];
+
+const LAST_INITIALS = [
+  "A", "B", "T", "M", "G", "K", "H", "D", "S", "Y",
+  "W", "N", "F", "R", "L", "Z", "E", "C", "O", "J"
+];
+
+function pickBotName(i) {
+  // Deterministic so bot N always gets the same name across restarts.
+  const first = FIRST_NAMES[i % FIRST_NAMES.length];
+  const last = LAST_INITIALS[Math.floor(i / FIRST_NAMES.length) % LAST_INITIALS.length];
+  return `${first} ${last}.`;
+}
 
 // ============================================================
 // TELEGRAM AUTH
@@ -93,7 +126,7 @@ function extractInitData(req) {
 }
 
 // ============================================================
-// ENSURE USER — welcome bonus for brand-new humans
+// ENSURE USER
 // ============================================================
 
 async function ensureUser(tgUser) {
@@ -179,10 +212,6 @@ const apiLimiter = rateLimit({
 });
 app.use("/api", apiLimiter);
 
-// ============================================================
-// HTTP + WS
-// ============================================================
-
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
@@ -252,11 +281,9 @@ async function initDatabase() {
 }
 
 // ============================================================
-// BOT SEEDING — 100 bots each with 10000 birr, every round
+// BOT SEEDING — 100 named bots, each with 10000 birr
 // ============================================================
 
-// Bot IDs live in a reserved range so they never collide with real Telegram users.
-// Telegram user IDs are 32-bit ints, so we start at 9,000,000,000,000 (way above).
 const BOT_ID_BASE = 9000000000000;
 
 async function seedBots() {
@@ -264,17 +291,22 @@ async function seedBots() {
 
   for (let i = 0; i < BOT_COUNT; i++) {
     const botId = BOT_ID_BASE + i;
-    const botName = `Bot ${i + 1}`;
+    const botName = pickBotName(i);
     await pool.query(
       `INSERT INTO users (telegram_id, username, first_name, balance, is_bot)
        VALUES ($1, $2, $3, $4, TRUE)
        ON CONFLICT (telegram_id)
-       DO UPDATE SET balance = $4, first_name = $3, is_bot = TRUE, updated_at = NOW()`,
+       DO UPDATE SET
+         first_name = $3,
+         balance = $4,
+         is_bot = TRUE,
+         updated_at = NOW()`,
       [botId, null, botName, BOT_BALANCE]
     );
   }
 
-  console.log(`✅ ${BOT_COUNT} bots ready (each ${BOT_BALANCE} birr)`);
+  console.log(`✅ ${BOT_COUNT} named bots ready (each ${BOT_BALANCE} birr)`);
+  console.log(`   Sample: ${pickBotName(0)}, ${pickBotName(1)}, ${pickBotName(2)}, … ${pickBotName(BOT_COUNT - 1)}`);
 }
 
 // ============================================================
@@ -329,9 +361,9 @@ const game = {
   drawn: [],
   drawnSet: new Set(),
   prize: 0,
-  players: new Map(),       // tgId -> { names, isBot }
-  cards: new Map(),         // cardNo -> owner (tgId number or 'bot:ID')
-  bots: [],                 // [{ id, names, cards }] for the current round
+  players: new Map(),
+  cards: new Map(),
+  bots: [],
   winner: null,
   lobbyTimer: null,
   callTimer: null,
@@ -419,14 +451,14 @@ function startCountdown() {
   }, 1000);
 }
 
-// Every bot joins every round with 1–2 random unused cards.
+// Every bot joins every round with 1–2 random unused cards, using a real name.
 function addBots() {
   game.bots = [];
   const usedCards = new Set(game.cards.keys());
 
   for (let i = 0; i < BOT_COUNT; i++) {
     const botTgId = BOT_ID_BASE + i;
-    const botName = `Bot ${i + 1}`;
+    const botName = pickBotName(i);
     const botCards = [];
 
     const nCards = 1 + Math.floor(Math.random() * 2); // 1 or 2 cards
@@ -438,7 +470,7 @@ function addBots() {
         guard++;
       } while (usedCards.has(n) && guard < 5000);
 
-      if (usedCards.has(n)) continue; // pool exhausted (500 cards all taken)
+      if (usedCards.has(n)) continue;
       usedCards.add(n);
       botCards.push(n);
       game.cards.set(n, botTgId);
@@ -492,12 +524,11 @@ function findWinner() {
   for (const [cardNo, owner] of game.cards) {
     const card = cardFor(cardNo);
     if (hasLine(card, game.drawnSet)) {
-      // owner is either a bot tgId (number >= BOT_ID_BASE) or a human tgId
       const ownerNum = typeof owner === "number" ? owner : Number(owner);
       if (ownerNum >= BOT_ID_BASE) {
         const idx = ownerNum - BOT_ID_BASE;
         const bot = game.bots.find((b) => b.id === idx);
-        return { names: bot ? bot.names : [`Bot ${idx + 1}`], card: cardNo, tgId: null };
+        return { names: bot ? bot.names : [pickBotName(idx)], card: cardNo, tgId: null };
       } else {
         const p = game.players.get(ownerNum);
         return { names: p ? p.names : ["Player"], card: cardNo, tgId: ownerNum };
@@ -522,7 +553,6 @@ async function finishRound(winner) {
       tgId: winner.tgId
     };
 
-    // Only pay humans; bots don't need real balance updates for display purposes.
     if (winner.tgId) {
       try {
         const client = await pool.connect();
@@ -603,7 +633,6 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // Block bot IDs from authenticating as humans
       if (Number(tg.id) >= BOT_ID_BASE) {
         try { ws.send(JSON.stringify({ type: "error", msg: "Invalid user" })); } catch {}
         return;
@@ -624,7 +653,6 @@ wss.on("connection", (ws) => {
         try { ws.send(JSON.stringify({ type: "error", msg: `🎁 Welcome! You got ${WELCOME_BONUS} birr free.` })); } catch {}
       }
 
-      // Start the countdown once at least one human has arrived (bots fill the rest).
       if (game.phase === "lobby" && !game.lobbyTimer && game.players.size >= 1) {
         startCountdown();
       }
@@ -717,7 +745,7 @@ wss.on("connection", (ws) => {
 });
 
 // ============================================================
-// REST: /api/me, /api/deposit, /api/withdraw
+// REST
 // ============================================================
 
 app.get("/api/me", authMiddleware, async (req, res) => {
