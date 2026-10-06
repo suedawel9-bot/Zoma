@@ -1,6 +1,6 @@
 // ============================================================
 // BINGO TELEGRAM MINI APP SERVER
-// Updated: 2026-10-06 (ESM, with fixes)
+// Updated: 2026-10-06 (ESM + static frontend + fixes)
 // ============================================================
 
 console.log("🔥 BINGO SERVER NEW VERSION 2026-10-06");
@@ -8,10 +8,19 @@ console.log("🔥 BINGO SERVER NEW VERSION 2026-10-06");
 import express from "express";
 import http from "http";
 import crypto from "crypto";
+import path from "path";
+import { fileURLToPath } from "url";
 import { Pool } from "pg";
 import { WebSocketServer } from "ws";
 import { Bot } from "grammy";
 import rateLimit from "express-rate-limit";
+
+// ============================================================
+// PATHS
+// ============================================================
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ============================================================
 // CONFIG
@@ -45,6 +54,12 @@ app.set("trust proxy", 1);
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
+
+// ============================================================
+// STATIC FRONTEND (Mini App)
+// ============================================================
+
+app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
 // HTTP SERVER
@@ -87,22 +102,16 @@ const wss = new WebSocketServer({
 const clients = new Set();
 
 wss.on("connection", (ws, req) => {
-  // Authenticate WS via initData in query string
   let telegramUser = null;
   try {
     const url = new URL(req.url, "http://localhost");
     const initData = url.searchParams.get("initData");
     telegramUser = validateTelegramWebAppData(initData);
-  } catch (err) {
+  } catch {
     telegramUser = null;
   }
 
-  // Allow unauthenticated connections to see public state only.
-  // If you want strict auth, uncomment below:
-  // if (!telegramUser) { ws.close(1008, "Unauthorized"); return; }
-
   ws.telegramId = telegramUser ? Number(telegramUser.id) : null;
-
   clients.add(ws);
 
   console.log(
@@ -132,9 +141,11 @@ function broadcast(message) {
   for (const ws of clients) {
     if (ws.readyState !== 1) continue;
     try {
-      // Build per-client message so each client only sees their own cards
       const payload =
-        message.type === "gameState" || message.type === "roundEnded"
+        message.type === "gameState" ||
+        message.type === "roundEnded" ||
+        message.type === "cardsReleased" ||
+        message.type === "cardPurchased"
           ? { ...message, state: publicGameState(ws.telegramId) }
           : message;
       ws.send(JSON.stringify(payload));
@@ -245,7 +256,6 @@ function validateTelegramWebAppData(initData) {
     const hash = params.get("hash");
     if (!hash) return null;
 
-    // Replay protection: reject if auth_date older than 24h
     const authDate = Number(params.get("auth_date") || 0);
     if (!authDate) return null;
     const ageSeconds = Math.floor(Date.now() / 1000) - authDate;
@@ -268,7 +278,6 @@ function validateTelegramWebAppData(initData) {
       .update(dataCheckString)
       .digest("hex");
 
-    // Timing-safe compare
     const a = Buffer.from(calculatedHash, "hex");
     const b = Buffer.from(hash, "hex");
     if (a.length !== b.length) return null;
@@ -356,19 +365,20 @@ const generalLimiter = rateLimit({
   legacyHeaders: false
 });
 
-app.use(generalLimiter);
+app.use("/api", generalLimiter);
 
 // ============================================================
-// HEALTH
+// LANDING / HEALTH
 // ============================================================
 
-app.get("/", (req, res) => {
+// Debug/status page (not the Mini App)
+app.get("/debug", (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
       <meta charset="UTF-8">
-      <title>Bingo Server</title>
+      <title>Bingo Server Status</title>
       <style>
         body {
           font-family: Arial, sans-serif;
@@ -378,12 +388,15 @@ app.get("/", (req, res) => {
           padding: 40px;
         }
         .ok { color: #00ff88; }
+        code { background:#222; padding:2px 6px; border-radius:4px; }
       </style>
     </head>
     <body>
       <h1>🎱 Bingo Server</h1>
       <p class="ok">Server is running</p>
       <p>Telegram Bot: ${ENABLE_BOT ? "Enabled" : "Disabled"}</p>
+      <p>Health: <code>/health</code></p>
+      <p>Mini App: <code>/</code></p>
     </body>
     </html>
   `);
@@ -449,7 +462,7 @@ app.get("/api/balance", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// DEPOSIT (DEMO ONLY - DO NOT USE IN PROD)
+// DEPOSIT (DEMO ONLY)
 // ============================================================
 
 app.post("/api/deposit", authMiddleware, async (req, res) => {
@@ -569,7 +582,9 @@ app.post("/api/promo", authMiddleware, async (req, res) => {
 
     if (promo.used_count >= promo.max_uses) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "Promo code already used" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Promo code already used" });
     }
 
     const claimCheck = await client.query(
@@ -579,7 +594,9 @@ app.post("/api/promo", authMiddleware, async (req, res) => {
 
     if (claimCheck.rows.length) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ ok: false, error: "Promo already claimed" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Promo already claimed" });
     }
 
     await client.query(
@@ -689,13 +706,30 @@ function cardHasWin(card) {
   for (let c = 0; c < 5; c++) {
     let win = true;
     for (let r = 0; r < 5; r++) {
-      if (!marked[r][c]) { win = false; break; }
+      if (!marked[r][c]) {
+        win = false;
+        break;
+      }
     }
     if (win) return true;
   }
 
-  if (marked[0][0] && marked[1][1] && marked[2][2] && marked[3][3] && marked[4][4]) return true;
-  if (marked[0][4] && marked[1][3] && marked[2][2] && marked[3][1] && marked[4][0]) return true;
+  if (
+    marked[0][0] &&
+    marked[1][1] &&
+    marked[2][2] &&
+    marked[3][3] &&
+    marked[4][4]
+  )
+    return true;
+  if (
+    marked[0][4] &&
+    marked[1][3] &&
+    marked[2][2] &&
+    marked[3][1] &&
+    marked[4][0]
+  )
+    return true;
 
   return false;
 }
@@ -719,7 +753,6 @@ function calculatePrize() {
 // ============================================================
 
 function publicGameState(forTelegramId = null) {
-  // Public: send only IDs + owners for all cards (no card numbers)
   const cardMeta = [];
   const myCards = [];
 
@@ -757,6 +790,7 @@ function publicGameState(forTelegramId = null) {
     myCards,
     cardCount: cardCount(),
     maxCards: MAX_CARDS_PER_ROUND,
+    maxCardsPerUser: MAX_CARDS_PER_USER,
     cardPrice: CARD_PRICE,
     prize: game.prize,
     winner: winnerPublic
@@ -937,7 +971,7 @@ function findWinner() {
 }
 
 // ============================================================
-// PAYOUT
+// PAYOUT / REFUND
 // ============================================================
 
 async function payWinner(winnerTelegramId, amount, reference) {
@@ -966,7 +1000,6 @@ async function payWinner(winnerTelegramId, amount, reference) {
 }
 
 async function refundAllBuyers(reason = "round_void") {
-  // Refund every card purchase from this round
   const refundsByUser = new Map();
 
   for (const entry of game.cards.values()) {
@@ -1019,7 +1052,6 @@ async function endRound(winner) {
   game.winner = winner;
   game.status = "winner_popup";
 
-  // PAY THE WINNER
   if (winner && game.prize > 0) {
     try {
       await payWinner(
@@ -1058,7 +1090,6 @@ async function endRoundNoWinner() {
   clearInterval(game.callingTimer);
   game.callingTimer = null;
 
-  // Refund everyone since there's no winner
   game.prize = 0;
   game.winner = null;
   game.status = "winner_popup";
@@ -1148,9 +1179,18 @@ function startCountdownForExistingRound() {
 // ============================================================
 
 function clearTimers() {
-  if (game.countdownTimer) { clearInterval(game.countdownTimer); game.countdownTimer = null; }
-  if (game.callingTimer) { clearInterval(game.callingTimer); game.callingTimer = null; }
-  if (game.popupTimer) { clearTimeout(game.popupTimer); game.popupTimer = null; }
+  if (game.countdownTimer) {
+    clearInterval(game.countdownTimer);
+    game.countdownTimer = null;
+  }
+  if (game.callingTimer) {
+    clearInterval(game.callingTimer);
+    game.callingTimer = null;
+  }
+  if (game.popupTimer) {
+    clearTimeout(game.popupTimer);
+    game.popupTimer = null;
+  }
 }
 
 // ============================================================
@@ -1230,7 +1270,6 @@ app.post("/api/bingo/buy", buyLimiter, authMiddleware, async (req, res) => {
       [telegramId, CARD_PRICE, `bingo_${game.roundNumber}_${cardId}`]
     );
 
-    // Persist the card for auditing
     if (game.roundId) {
       await client.query(
         `INSERT INTO bingo_cards (round_id, card_id, telegram_id, card, price)
@@ -1282,6 +1321,17 @@ app.get("/api/bingo/round", authMiddleware, (req, res) => {
     ok: true,
     round: publicGameState(telegramId)
   });
+});
+
+// ============================================================
+// SPA FALLBACK — serve Mini App for any non-API route
+// ============================================================
+
+app.get("*", (req, res, next) => {
+  if (req.path.startsWith("/api") || req.path.startsWith("/ws")) {
+    return next();
+  }
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 // ============================================================
@@ -1372,14 +1422,20 @@ async function shutdown(signal) {
   clearTimers();
 
   if (bot) {
-    try { await bot.stop(); } catch {}
+    try {
+      await bot.stop();
+    } catch {}
   }
 
   for (const ws of clients) {
-    try { ws.close(); } catch {}
+    try {
+      ws.close();
+    } catch {}
   }
 
-  try { await pool.end(); } catch {}
+  try {
+    await pool.end();
+  } catch {}
 
   server.close(() => {
     console.log("✅ Server closed");
