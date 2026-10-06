@@ -1,7 +1,8 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Matches public/index.html + public/cards.js contract
 // Updated: 2026-10-07
+//  - Welcome 100 birr for new users
+//  - 100 bots every round, each with 10,000 birr balance
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-07");
@@ -26,18 +27,22 @@ const PORT = Number(process.env.PORT || 8080);
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
-// Game settings
-const CARD_PRICE = Number(process.env.CARD_PRICE || 10);       // birr per card
-const HOUSE_CUT = Number(process.env.HOUSE_CUT || 0);         // 0..1
-const TOTAL_CARDS = 500;                                      // matches cards.js
+const CARD_PRICE = Number(process.env.CARD_PRICE || 10);
+const HOUSE_CUT = Number(process.env.HOUSE_CUT || 0);
+const TOTAL_CARDS = 500;
 const MAX_CARDS_PER_PLAYER = 4;
-const MIN_PLAYERS_TO_START = 2;                               // humans + bots
+const MIN_HUMANS_TO_START = 1;          // at least 1 real player to start (bots fill the rest)
 const LOBBY_COUNTDOWN = Number(process.env.ROUND_COUNTDOWN || 30);
 const CALL_INTERVAL_MS = Number(process.env.CALL_INTERVAL_MS || 3500);
 const WINNER_POPUP_SECONDS = Number(process.env.WINNER_POPUP_SECONDS || 4);
-const BOT_COUNT = Number(process.env.BOT_COUNT || 3);         // bots to add each round
 
-// Telebirr receiving account (shown to depositors)
+// ✨ NEW
+const WELCOME_BONUS = Number(process.env.WELCOME_BONUS || 100);
+const BOT_COUNT = Number(process.env.BOT_COUNT || 100);
+const BOT_START_BALANCE = Number(process.env.BOT_START_BALANCE || 10000);
+const BOT_MAX_CARDS_PER_ROUND = Number(process.env.BOT_MAX_CARDS_PER_ROUND || 4);
+
+// Telebirr receiving account
 const TB_NUMBER = process.env.TB_NUMBER || "0911-000-000";
 const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 
@@ -78,7 +83,6 @@ function validateInitData(initData) {
   }
 }
 
-// Accept initData via x-init (frontend) OR x-telegram-init-data OR body/query
 function extractInitData(req) {
   return (
     req.headers["x-init"] ||
@@ -89,6 +93,61 @@ function extractInitData(req) {
   );
 }
 
+// ============================================================
+// ENSURE USER — welcome bonus for new users
+// ============================================================
+
+async function ensureUser(tgUser) {
+  const existing = await pool.query(
+    `SELECT telegram_id, balance FROM users WHERE telegram_id = $1`,
+    [tgUser.id]
+  );
+
+  if (existing.rows.length) {
+    await pool.query(
+      `UPDATE users
+       SET username = $1, first_name = $2, last_name = $3, updated_at = NOW()
+       WHERE telegram_id = $4`,
+      [
+        tgUser.username || null,
+        tgUser.first_name || null,
+        tgUser.last_name || null,
+        tgUser.id
+      ]
+    );
+    return { isNew: false, balance: Number(existing.rows[0].balance) };
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO users (telegram_id, username, first_name, last_name, balance)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING balance`,
+    [
+      tgUser.id,
+      tgUser.username || null,
+      tgUser.first_name || null,
+      tgUser.last_name || null,
+      WELCOME_BONUS
+    ]
+  );
+
+  if (WELCOME_BONUS > 0) {
+    await pool.query(
+      `INSERT INTO transactions (telegram_id, type, amount, status)
+       VALUES ($1, 'welcome_bonus', $2, 'completed')`,
+      [tgUser.id, WELCOME_BONUS]
+    );
+  }
+
+  console.log(
+    `🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id} (${
+      tgUser.first_name || tgUser.username || "new"
+    })`
+  );
+
+  return { isNew: true, balance: Number(inserted.rows[0].balance) };
+}
+
 async function authMiddleware(req, res, next) {
   try {
     const tgUser = validateInitData(extractInitData(req));
@@ -96,24 +155,7 @@ async function authMiddleware(req, res, next) {
       return res.status(401).json({ error: "Invalid Telegram Mini App authentication" });
     }
     req.tgUser = tgUser;
-
-    await pool.query(
-      `INSERT INTO users (telegram_id, username, first_name, last_name)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (telegram_id)
-       DO UPDATE SET
-         username = EXCLUDED.username,
-         first_name = EXCLUDED.first_name,
-         last_name = EXCLUDED.last_name,
-         updated_at = NOW()`,
-      [
-        tgUser.id,
-        tgUser.username || null,
-        tgUser.first_name || null,
-        tgUser.last_name || null
-      ]
-    );
-
+    await ensureUser(tgUser);
     next();
   } catch (err) {
     console.error("auth middleware:", err);
@@ -138,10 +180,6 @@ const apiLimiter = rateLimit({
   legacyHeaders: false
 });
 app.use("/api", apiLimiter);
-
-// ============================================================
-// HTTP + WS
-// ============================================================
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -171,9 +209,15 @@ async function initDatabase() {
       first_name TEXT,
       last_name TEXT,
       balance NUMERIC(18,2) NOT NULL DEFAULT 0,
+      is_bot BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  // Safety: add is_bot column if it's missing (migration)
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;
   `);
 
   await pool.query(`
@@ -207,7 +251,40 @@ async function initDatabase() {
 }
 
 // ============================================================
-// CARD LOGIC (mirror of public/cards.js)
+// BOTS — persistent in DB, 10000 birr each
+// ============================================================
+
+// Bot telegram_ids are negative so they never collide with real users.
+// Real Telegram IDs are positive; we use -(i+1).
+function botTelegramId(i) {
+  return -(i + 1);
+}
+
+async function ensureBots() {
+  // Create/refresh all bots in DB with at least BOT_START_BALANCE
+  for (let i = 0; i < BOT_COUNT; i++) {
+    const tgId = botTelegramId(i);
+    await pool.query(
+      `INSERT INTO users (telegram_id, username, first_name, last_name, balance, is_bot)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       ON CONFLICT (telegram_id) DO UPDATE SET
+         is_bot = TRUE,
+         first_name = EXCLUDED.first_name,
+         updated_at = NOW()`,
+      [
+        tgId,
+        `bot_${i + 1}`,
+        `Bot ${i + 1}`,
+        null,
+        BOT_START_BALANCE
+      ]
+    );
+  }
+  console.log(`🤖 ${BOT_COUNT} bots ready (each starts with ${BOT_START_BALANCE} birr)`);
+}
+
+// ============================================================
+// CARD LOGIC
 // ============================================================
 
 function seeded(a) {
@@ -249,22 +326,8 @@ function hasLine(card, drawnSet) {
 }
 
 // ============================================================
-// IN-MEMORY GAME STATE
+// GAME STATE
 // ============================================================
-
-/*
-  state = {
-    phase: 'lobby' | 'playing' | 'over',
-    countdown: number | null,
-    drawn: number[],
-    drawnSet: Set<number>,
-    prize: number,
-    players: Map<telegramId, { names: string[], isBot: boolean }>,
-    cards: Map<cardNo, telegramId>,   // which player owns card #
-    bots: [{ id, names, cards: [1,2] }],
-    winner: null | { names, card, prize, you? }
-  }
-*/
 
 const game = {
   phase: "lobby",
@@ -272,9 +335,9 @@ const game = {
   drawn: [],
   drawnSet: new Set(),
   prize: 0,
-  players: new Map(),       // telegramId -> { names, isBot }
-  cards: new Map(),         // cardNo -> telegramId (or 'bot:ID')
-  bots: [],                 // [{ id, names, cards }]
+  players: new Map(),      // human players only: tgId -> { names }
+  cards: new Map(),        // cardNo -> owner ("user:tgId" | "bot:i")
+  bots: [],                // [{ i, names, cards }]
   winner: null,
   lobbyTimer: null,
   callTimer: null,
@@ -285,31 +348,28 @@ function drawnPrize() {
   return Math.max(0, Math.floor(game.cards.size * CARD_PRICE * (1 - HOUSE_CUT)));
 }
 
-function broadcast(msg) {
-  const data = JSON.stringify(msg);
-  for (const ws of wss.clients) {
-    if (ws.readyState === 1) {
-      try { ws.send(data); } catch {}
-    }
+function ownerKind(owner) {
+  if (typeof owner === "string" && owner.startsWith("bot:")) {
+    const idx = Number(owner.slice(4));
+    return { kind: "bot", index: idx };
   }
+  if (typeof owner === "string" && owner.startsWith("user:")) {
+    const id = Number(owner.slice(5));
+    return { kind: "user", tgId: id };
+  }
+  // Fallback: raw numeric tgId (from older code path)
+  return { kind: "user", tgId: Number(owner) };
 }
 
-// Build state payload for a specific user (or anonymous)
 function publicState(forTgId) {
   const cardsForUser = [];
   for (const [cardNo, owner] of game.cards) {
-    const isMine = owner === forTgId;
-    const ownerObj = typeof owner === "string" && owner.startsWith("bot:")
-      ? game.bots.find((b) => `bot:${b.id}` === owner)
-      : game.players.get(owner);
-
-    // Only send the user their own cards
-    if (isMine) {
+    const info = ownerKind(owner);
+    if (info.kind === "user" && info.tgId === forTgId) {
       cardsForUser.push({ no: cardNo, card: cardFor(cardNo) });
     }
   }
 
-  // Taken = every card number already purchased (humans + bots)
   const taken = [...game.cards.keys()].sort((a, b) => a - b);
 
   const winnerPayload = game.winner
@@ -327,7 +387,7 @@ function publicState(forTgId) {
     countdown: game.countdown,
     drawn: game.drawn,
     prize: drawnPrize(),
-    players: [...game.players.values()].filter((p) => !p.isBot).length,
+    players: game.players.size,
     bots: game.bots.length,
     taken,
     max: MAX_CARDS_PER_PLAYER,
@@ -379,14 +439,17 @@ function startCountdown() {
   }, 1000);
 }
 
-function addBots() {
+// 100 bots — each takes 1 to 4 random cards and pays from their balance
+async function addBotsAndBuyCards() {
   game.bots = [];
   const usedCards = new Set(game.cards.keys());
+
   for (let i = 0; i < BOT_COUNT; i++) {
-    const names = [`Bot ${i + 1}`];
+    const tgId = botTelegramId(i);
     const botCards = [];
-    // give each bot 1–2 random unused cards
-    const nCards = 1 + Math.floor(Math.random() * 2);
+
+    const nCards = 1 + Math.floor(Math.random() * BOT_MAX_CARDS_PER_ROUND);
+
     for (let k = 0; k < nCards; k++) {
       let n;
       let guard = 0;
@@ -399,23 +462,45 @@ function addBots() {
       botCards.push(n);
       game.cards.set(n, `bot:${i}`);
     }
-    game.bots.push({ id: i, names, cards: botCards });
+
+    if (botCards.length) {
+      // Charge the bot's balance in DB
+      const cost = botCards.length * CARD_PRICE;
+      try {
+        await pool.query(
+          `UPDATE users SET balance = GREATEST(balance - $1, 0), updated_at = NOW()
+           WHERE telegram_id = $2`,
+          [cost, tgId]
+        );
+        await pool.query(
+          `INSERT INTO transactions (telegram_id, type, amount, status)
+           VALUES ($1, 'bot_card', $2, 'completed')`,
+          [tgId, cost]
+        );
+      } catch (err) {
+        console.error("bot charge:", err);
+      }
+    }
+
+    game.bots.push({
+      i,
+      names: [`Bot ${i + 1}`],
+      cards: botCards
+    });
   }
 }
 
 async function startRound() {
   if (game.phase === "playing" || game.phase === "over") return;
 
-  // Need at least 1 human + bots (or MIN_PLAYERS humans)
-  const humanCount = game.players.size;
-  const total = humanCount + BOT_COUNT;
-  if (total < MIN_PLAYERS_TO_START) {
-    // reset to lobby
+  // Needs at least 1 human player
+  if (game.players.size < MIN_HUMANS_TO_START) {
     startLobby();
     return;
   }
 
-  addBots();
+  await addBotsAndBuyCards();
+
   game.phase = "playing";
   game.countdown = null;
   sendState();
@@ -431,7 +516,6 @@ async function startRound() {
   }
 
   game.callTimer = setInterval(callNext, CALL_INTERVAL_MS);
-  // First call after a short delay to let clients render
   setTimeout(callNext, 1500);
 }
 
@@ -447,7 +531,6 @@ function callNext() {
   game.drawn.push(n);
   game.drawnSet.add(n);
 
-  // Check each player's cards for a line
   const winner = findWinner();
   if (winner) return finishRound(winner);
 
@@ -458,17 +541,21 @@ function findWinner() {
   for (const [cardNo, owner] of game.cards) {
     const card = cardFor(cardNo);
     if (hasLine(card, game.drawnSet)) {
+      const info = ownerKind(owner);
       let names;
       let tgId = null;
-      if (typeof owner === "string" && owner.startsWith("bot:")) {
-        const bot = game.bots.find((b) => `bot:${b.id}` === owner);
-        names = bot ? bot.names : ["Bot"];
+
+      if (info.kind === "bot") {
+        const bot = game.bots.find((b) => b.i === info.index);
+        names = bot ? bot.names : [`Bot ${info.index + 1}`];
+        tgId = botTelegramId(info.index);
       } else {
-        const p = game.players.get(owner);
+        const p = game.players.get(info.tgId);
         names = p ? p.names : ["Player"];
-        tgId = owner;
+        tgId = info.tgId;
       }
-      return { names, card: cardNo, tgId };
+
+      return { names, card: cardNo, tgId, isBot: info.kind === "bot" };
     }
   }
   return null;
@@ -489,7 +576,7 @@ async function finishRound(winner) {
       tgId: winner.tgId
     };
 
-    // Pay human winners
+    // Credit the prize to whoever won — human OR bot
     if (winner.tgId) {
       try {
         const client = await pool.connect();
@@ -510,10 +597,18 @@ async function finishRound(winner) {
         } finally {
           client.release();
         }
-        // Push balance update to that client
-        for (const ws of wss.clients) {
-          if (ws.tgId === winner.tgId) {
-            try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(winner.tgId) })); } catch {}
+
+        // Push live balance update to a human winner
+        if (!winner.isBot) {
+          for (const ws of wss.clients) {
+            if (ws.tgId === winner.tgId) {
+              try {
+                ws.send(JSON.stringify({
+                  type: "balance",
+                  balance: await getBalance(winner.tgId)
+                }));
+              } catch {}
+            }
           }
         }
       } catch (err) {
@@ -552,46 +647,58 @@ async function getBalance(tgId) {
   return Number(r.rows[0]?.balance || 0);
 }
 
-// Auto-start first lobby
-startLobby();
-
 // ============================================================
 // WEBSOCKET
 // ============================================================
 
 wss.on("connection", (ws) => {
   ws.tgId = null;
-  ws.isAlive = true;
 
   ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
+    // --- AUTH ---
     if (msg.type === "auth") {
       const tg = validateInitData(msg.initData);
       if (!tg) {
         try { ws.send(JSON.stringify({ type: "error", msg: "Invalid Telegram authentication" })); } catch {}
         return;
       }
-      ws.tgId = tg.id;
 
-      // register in players map
-      const names = [tg.first_name, tg.last_name].filter(Boolean).join(" ") || tg.username || `Player ${String(tg.id).slice(-4)}`;
-      if (!game.players.has(tg.id)) {
-        game.players.set(tg.id, { names: [names], isBot: false, tg });
+      // Ensure user row exists (welcome bonus on first sight)
+      let bal;
+      try {
+        const r = await ensureUser(tg);
+        bal = r.balance;
+      } catch (err) {
+        console.error("ensureUser (ws):", err);
+        try { ws.send(JSON.stringify({ type: "error", msg: "Database error" })); } catch {}
+        return;
       }
 
-      try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(tg.id) })); } catch {}
+      ws.tgId = tg.id;
+
+      const name =
+        [tg.first_name, tg.last_name].filter(Boolean).join(" ") ||
+        tg.username ||
+        `Player ${String(tg.id).slice(-4)}`;
+
+      if (!game.players.has(tg.id)) {
+        game.players.set(tg.id, { names: [name], tg });
+      }
+
+      try { ws.send(JSON.stringify({ type: "balance", balance: bal })); } catch {}
       try { ws.send(JSON.stringify(publicState(tg.id))); } catch {}
 
-      // Start countdown if enough players and still lobby
-      const total = game.players.size + BOT_COUNT;
-      if (game.phase === "lobby" && !game.lobbyTimer && total >= MIN_PLAYERS_TO_START) {
+      // If the lobby is idle but has at least 1 human, start the countdown
+      if (game.phase === "lobby" && !game.lobbyTimer && game.players.size >= MIN_HUMANS_TO_START) {
         startCountdown();
       }
       return;
     }
 
+    // --- JOIN (buy specific cards) ---
     if (msg.type === "join") {
       if (!ws.tgId) {
         try { ws.send(JSON.stringify({ type: "error", msg: "Not authenticated" })); } catch {}
@@ -603,22 +710,19 @@ wss.on("connection", (ws) => {
       }
 
       const requested = Array.isArray(msg.cards) ? msg.cards : [];
-      const player = game.players.get(ws.tgId);
-      if (!player) {
-        try { ws.send(JSON.stringify({ type: "error", msg: "Not registered" })); } catch {}
-        return;
+      const owned = [];
+      for (const [n, owner] of game.cards) {
+        const info = ownerKind(owner);
+        if (info.kind === "user" && info.tgId === ws.tgId) owned.push(n);
       }
-
-      // Enforce rules
-      const owned = [...game.cards.entries()].filter(([, o]) => o === ws.tgId).map(([n]) => n);
       const room = MAX_CARDS_PER_PLAYER - owned.length;
 
       const valid = [];
       for (const n of requested) {
         if (!Number.isInteger(n) || n < 1 || n > TOTAL_CARDS) continue;
-        if (game.cards.has(n)) continue;              // already taken
-        if (owned.includes(n)) continue;              // already owned by you
-        if (valid.includes(n)) continue;              // dupe in this request
+        if (game.cards.has(n)) continue;
+        if (owned.includes(n)) continue;
+        if (valid.includes(n)) continue;
         valid.push(n);
       }
       const take = valid.slice(0, room);
@@ -629,7 +733,6 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // Charge
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -663,33 +766,24 @@ wss.on("connection", (ws) => {
         client.release();
       }
 
-      for (const n of take) game.cards.set(n, ws.tgId);
+      for (const n of take) game.cards.set(n, `user:${ws.tgId}`);
 
       try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
       sendState();
 
-      // If the lobby is full/ready, start the countdown
-      if (!game.lobbyTimer && game.phase === "lobby") {
-        const total = game.players.size + BOT_COUNT;
-        if (total >= MIN_PLAYERS_TO_START && game.cards.size > 0) {
-          startCountdown();
-        }
+      if (!game.lobbyTimer && game.phase === "lobby" && game.players.size >= MIN_HUMANS_TO_START) {
+        startCountdown();
       }
       return;
     }
   });
 
-  ws.on("close", () => {
-    // Note: we do NOT remove the player from game.players on disconnect.
-    // Their balance is safe, their cards remain owned for the current round.
-    // This is simpler and avoids accidental card loss on network blips.
-  });
-
+  ws.on("close", () => {});
   ws.on("error", () => {});
 });
 
 // ============================================================
-// REST: /api/me, /api/deposit, /api/withdraw
+// REST
 // ============================================================
 
 app.get("/api/me", authMiddleware, async (req, res) => {
@@ -722,18 +816,15 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
   }
 
   try {
-    // Prevent duplicate txId claims
     const dupe = await pool.query(`SELECT id FROM transactions WHERE tx_id = $1 LIMIT 1`, [txId]);
     if (dupe.rows.length) {
       return res.status(400).json({ error: "This transaction ID was already used" });
     }
-
     await pool.query(
       `INSERT INTO transactions (telegram_id, type, amount, status, tx_id)
        VALUES ($1, 'deposit', $2, 'pending', $3)`,
       [req.tgUser.id, amount, txId]
     );
-
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -760,12 +851,10 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
       [req.tgUser.id]
     );
     const bal = Number(u.rows[0]?.balance || 0);
-
     if (bal < amount) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Insufficient balance" });
     }
-
     await client.query(
       `UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE telegram_id = $2`,
       [amount, req.tgUser.id]
@@ -775,7 +864,6 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
        VALUES ($1, 'withdraw', $2, 'pending', $3)`,
       [req.tgUser.id, amount, phone]
     );
-
     await client.query("COMMIT");
     const newBal = await getBalance(req.tgUser.id);
     res.json({ balance: newBal });
@@ -788,20 +876,24 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
   }
 });
 
-// ============================================================
-// HEALTH + FALLBACK
-// ============================================================
-
 app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ ok: true, db: "connected", botToken: !!BOT_TOKEN, game: game.phase });
+    res.json({
+      ok: true,
+      db: "connected",
+      botToken: !!BOT_TOKEN,
+      game: game.phase,
+      humans: game.players.size,
+      bots: game.bots.length,
+      cards: game.cards.size
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// SPA fallback — every non-API path serves index.html
+// SPA fallback
 app.use((req, res, next) => {
   if (req.path.startsWith("/api") || req.path.startsWith("/ws")) return next();
   res.sendFile(path.join(__dirname, "public", "index.html"));
@@ -813,15 +905,18 @@ app.use((req, res, next) => {
 
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🎱 Zoma Bingo on :${PORT}`);
-  console.log(`🤖 ENABLE_BOT not used — WS auth only`);
   console.log(`💵 CARD_PRICE=${CARD_PRICE}  🏆 HOUSE_CUT=${HOUSE_CUT}`);
-  console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}`);
+  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS}`);
+  console.log(`🤖 BOT_COUNT=${BOT_COUNT}  💰 BOT_START_BALANCE=${BOT_START_BALANCE}`);
+  console.log(`👥 MIN_HUMANS_TO_START=${MIN_HUMANS_TO_START}`);
 
   try {
     await initDatabase();
+    await ensureBots();
     console.log("✅ Database ready");
+    startLobby();
   } catch (err) {
-    console.error("❌ DB init failed:", err);
+    console.error("❌ Boot failed:", err);
   }
 });
 
