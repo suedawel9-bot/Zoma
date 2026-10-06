@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Bingo</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#171a43;--panel:#232763;--ink:#f4f2ff;--mute:#a9acd9;--paper:#fbfaff;--cell:#1b1e4d;
+--B:#2f6bff;--I:#e8453c;--N:#f2b01e;--G:#22a06b;--O:#8e4dff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:500 16px/1.4 "Baloo 2",ui-rounded,system-ui,sans-serif;
+padding:12px 14px calc(90px + env(safe-area-inset-bottom));min-height:100vh}
+button{font:inherit;border:0;border-radius:14px;padding:12px 16px;font-weight:800;color:#fff;background:var(--O)}
+button:focus-visible,input:focus-visible{outline:3px solid var(--N);outline-offset:2px}
+button:disabled{opacity:.45}
+.top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.bal{font-size:26px;font-weight:800}.bal small{font-size:14px;color:var(--mute);font-weight:500;margin-right:6px}
+.row{display:flex;gap:8px}.row button{padding:8px 14px;background:var(--panel)}
+.stage{display:flex;align-items:center;gap:16px;margin:16px 0}
+.ball{width:104px;height:104px;border-radius:50%;flex:none;display:grid;place-items:center;text-align:center;
+background:radial-gradient(circle at 32% 28%,#fff 0 18%,var(--c,#555) 19%);color:#111;font-size:44px;font-weight:800;line-height:1;
+box-shadow:0 8px 0 rgba(0,0,0,.25)}
+.ball span{display:block;font-size:15px}
+.ball.pop{animation:pop .35s}
+@keyframes pop{from{transform:scale(.6)}60%{transform:scale(1.1)}}
+.info p{margin:0}.info .big{font-size:22px;font-weight:800}.mute{color:var(--mute)}
+.hist{display:flex;gap:6px;overflow-x:auto;padding:2px 0 10px}
+.hist i{flex:none;min-width:34px;height:34px;border-radius:50%;display:grid;place-items:center;font-style:normal;font-weight:800;font-size:14px;color:#111;background:var(--c)}
+.cards-wrap{display:grid;grid-template-columns:1fr;gap:10px}
+.card{background:var(--paper);border-radius:18px;padding:10px;color:#111;margin:0;min-width:0}
+.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+@media (min-width:430px){
+  .cards-wrap.cards-2,.cards-wrap.cards-3,.cards-wrap.cards-4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .cards-wrap.cards-3 .card:last-child{grid-column:1 / -1;width:calc(50% - 5px);justify-self:center}
+}
+@media (max-width:429px){
+  .cards-wrap.cards-2,.cards-wrap.cards-3,.cards-wrap.cards-4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .cards-wrap.cards-3 .card:last-child{grid-column:1 / -1;width:calc(50% - 5px);justify-self:center}
+}
+
+.h{height:34px;border-radius:10px;color:#fff;display:grid;place-items:center;font-size:20px;font-weight:800}
+.c{aspect-ratio:1;border-radius:12px;background:#fff;border:2px solid #dedaf3;color:#1b1e4d;font-size:22px;font-weight:800;padding:0}
+.c.hit{box-shadow:inset 0 0 0 3px var(--N)}
+.c.mk{background:var(--cell);color:#fff;border-color:var(--cell)}
+.c.free{background:var(--N);border-color:var(--N);color:#111;font-size:13px}
+.cta{width:100%;margin-top:12px;font-size:20px;padding:14px}
+.cta.go{background:var(--G)}
+.msg{margin:10px 0 0;min-height:22px;color:var(--N);font-weight:800}
+dialog{border:0;border-radius:20px;background:var(--panel);color:var(--ink);width:min(92vw,380px);padding:18px}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+label{display:block;margin:10px 0 4px;color:var(--mute)}
+input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;background:var(--bg);color:var(--ink);font:inherit;font-size:18px}
+.acct{background:var(--bg);border-radius:12px;padding:10px;margin:8px 0}
+.acct b{font-size:20px}
+.win{background:var(--G);border-radius:16px;padding:12px;text-align:center;font-size:20px;font-weight:800;margin-bottom:12px}
+@media (prefers-reduced-motion:reduce){.ball.pop{animation:none}}
+.nums{display:grid;grid-template-columns:repeat(auto-fill,minmax(40px,1fr));gap:5px;margin:10px 0}
+.nums button{padding:7px 0;background:var(--panel);font-size:14px;border-radius:10px}
+.nums button:disabled{opacity:.25}.nums button.sel{background:var(--N);color:#111}
+.prev{margin-top:8px}.prev .c{font-size:18px;display:grid;place-items:center}
+.c{display:grid;place-items:center}.cn{margin:0 0 6px;font-weight:800;color:#555}.card.win{box-shadow:0 0 0 4px var(--G)}
+.prev .card{margin-bottom:10px}
+
+.pcard{background:var(--panel);border-radius:18px;padding:14px;margin:12px 0}.pcard h3{margin:0 0 4px}
+.who{display:flex;align-items:center;gap:12px}.av{width:52px;height:52px;border-radius:50%;background:var(--O);display:grid;place-items:center;font-size:24px;font-weight:800}
+.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;background:var(--panel);padding:8px 12px calc(8px + env(safe-area-inset-bottom))}
+.tabs button{flex:1;background:transparent;color:var(--mute)}.tabs button.on{background:var(--bg);color:var(--ink)}
+.hr{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #3a3f86}.hr b{text-transform:capitalize}
+.hr b.approved,.hr b.paid{color:#5be3a3}.hr b.rejected{color:#ff8a80}.hr b.pending{color:var(--N)}
+#join{position:sticky;bottom:calc(74px + env(safe-area-inset-bottom));z-index:5;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+</style></head>
+<body>
+<div class="top">
+  <div class="bal"><small>Balance</small><span id="bal">–</span> birr</div>
+  
+</div>
+
+<main id="pgPlay">
+<div id="win" class="win" hidden></div>
+<div class="stage">
+  <div class="ball" id="ball" style="--c:#555">–</div>
+  <div class="info"><p class="big" id="status">Connecting…</p><p class="mute" id="sub"></p></div>
+</div>
+<div class="hist" id="hist"></div>
+
+<div id="play" hidden><div id="cards"></div></div>
+<div id="pick" hidden>
+  <p class="mute">Choose up to 4 cards (1 to 500). Selected cards are shown below the list. Grey cards are taken, including the bots\u2019 cards. Bingo is called automatically.</p>
+  <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
+  <div class="nums" id="nums"></div>
+  <div class="prev" id="prev"></div>
+  <button class="cta" id="join" disabled>Pick a card</button>
+</div>
+<p class="msg" id="msg" role="status"></p>
+</main>
+
+<main id="pgProfile" hidden>
+  <div class="pcard who"><div class="av" id="av">P</div><div><div class="big" id="pName">Player</div><div class="mute" id="pId"></div></div></div>
+  <section class="pcard"><h3>Deposit with Telebirr</h3>
+    <div class="acct">Send money to<br><b id="tbNum"></b><br><span class="mute" id="tbName"></span></div>
+    <label for="dAmt">Amount you sent (birr)</label><input id="dAmt" type="number" inputmode="numeric" min="10">
+    <label for="dTx">Transaction ID from the Telebirr SMS</label><input id="dTx" maxlength="10" autocapitalize="characters" placeholder="DJ57GEEQTD">
+    <p class="msg" id="dMsg"></p><button class="cta" id="dSend" style="margin-top:0">Send for approval</button></section>
+  <section class="pcard"><h3>Withdraw to Telebirr</h3>
+    <label for="wAmt">Amount (birr)</label><input id="wAmt" type="number" inputmode="numeric">
+    <label for="wPh">Telebirr phone number</label><input id="wPh" type="tel" placeholder="09XXXXXXXX">
+    <p class="msg" id="wMsg"></p><button class="cta" id="wSend" style="margin-top:0">Request withdrawal</button></section>
+  <section class="pcard"><h3>Promo code</h3>
+    <label for="pCode">Enter your code</label><input id="pCode" maxlength="20" autocapitalize="characters" placeholder="WELCOME20">
+    <p class="msg" id="pMsg"></p><button class="cta" id="pSend" style="margin-top:0">Apply</button></section>
+  <section class="pcard"><h3>History</h3><div id="hist2"><p class="mute">No deposits or withdrawals yet.</p></div></section>
+</main>
+<nav class="tabs"><button id="tPlay" class="on">🎱 Play</button><button id="tProf">👤 Profile</button></nav>
+
+<script type="module">
+import { cardFor, TOTAL } from "./cards.js";
+const tg = Telegram.WebApp; tg.ready(); tg.expand();
+const $ = (id) => document.getElementById(id);
+const COL = ["B","I","N","G","O"], CC = ["--B","--I","--N","--G","--O"];
+const colorOf = (n) => `var(${CC[Math.min(4, Math.floor((n - 1) / 15))]})`;
+const letterOf = (n) => COL[Math.min(4, Math.floor((n - 1) / 15))];
+let ws, S = null, marks = new Set(), cardKey = "", lastDrawn = 0, info = {};
+
+const api = async (path, body) => {
+  const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", "x-init": tg.initData }, body: body && JSON.stringify(body) });
+  const j = await r.json(); if (!r.ok) throw new Error(j.error || "Error"); return j;
+};
+const flash = (t) => { $("msg").textContent = t; setTimeout(() => ($("msg").textContent === t) && ($("msg").textContent = ""), 3500); };
+
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => ws.send(JSON.stringify({ type: "auth", initData: tg.initData }));
+  ws.onclose = () => { $("status").textContent = "Reconnecting…"; setTimeout(connect, 2000); };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === "balance") $("bal").textContent = m.balance;
+    if (m.type === "error") flash(m.msg);
+    if (m.type === "state") { S = m; render(); }
+  };
+}
+
+// ==UI==
+let sel = [], pk = "";
+const line = (c, d) => {
+  const ok = (n) => n === 0 || d.includes(n), L = [];
+  for (let i = 0; i < 5; i++) L.push(c[i], c.map((r) => r[i]));
+  L.push(c.map((r, i) => r[i]), c.map((r, i) => r[4 - i]));
+  return L.some((l) => l.every(ok));
+};
+const heads = () => COL.map((l, i) => `<div class="h" style="background:var(${CC[i]})">${l}</div>`).join("");
+const cells = (card, d) => card.flat().map((n) => `<div class="c ${n === 0 ? "free" : d && d.includes(n) ? "mk" : ""}">${n || "FREE"}</div>`).join("");
+function render() {
+  const s = S, d = s.drawn, last = d[d.length - 1], ball = $("ball");
+  if (last) {
+    ball.style.setProperty("--c", colorOf(last)); ball.innerHTML = `<div><span>${letterOf(last)}</span>${last}</div>`;
+    if (last !== lastDrawn) { ball.classList.remove("pop"); void ball.offsetWidth; ball.classList.add("pop"); }
+  } else { ball.style.setProperty("--c", "#555"); ball.textContent = "–"; }
+  lastDrawn = last || 0;
+  $("hist").innerHTML = d.slice(0, -1).reverse().map((n) => `<i style="--c:${colorOf(n)}">${n}</i>`).join("");
+  const st = $("status"), sub = $("sub"), info = `${s.players} players + ${s.bots} bots · prize ${s.prize} birr`;
+  if (s.phase === "lobby") { st.textContent = s.countdown !== null ? `Starting in ${s.countdown}s` : "Waiting for players"; sub.textContent = info; }
+  else if (s.phase === "playing") { st.textContent = "Numbers are being called"; sub.textContent = `${d.length} called · ${info}`; }
+  else { st.textContent = "Round over"; sub.textContent = "Next round starts soon"; }
+  $("win").hidden = !s.winner;
+  if (s.winner) $("win").textContent = s.winner.you ? `You won ${s.winner.prize} birr 🎉` : `${s.winner.names.join(", ")} won ${s.winner.prize} birr`;
+  const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
+  $("pick").hidden = !canBuy; if (canBuy) drawPicker();
+  $("play").hidden = !own;
+  const count = s.cards.length;
+  const layoutClass = count >= 4 ? "cards-4" : count === 3 ? "cards-3" : count === 2 ? "cards-2" : "cards-1";
+  $("cards").className = `cards-wrap ${layoutClass}`;
+  $("cards").innerHTML = s.cards.map((c) => { const w = line(c.card, d);
+    return `<div class="card${w ? " win" : ""}"><p class="cn">Card #${c.no}${w ? " · BINGO!" : ""}</p><div class="grid">${heads()}${cells(c.card, d)}</div></div>`; }).join("");
+}
+function drawPicker() {
+  const t = new Set(S.taken), room = S.max - S.cards.length;
+  sel = sel.filter((n) => !t.has(n)).slice(0, room);
+  const key = S.taken.join() + "|" + sel.join(); if (key === pk) return; pk = key;
+  const box = $("nums"), top = box.scrollTop; box.innerHTML = "";
+  for (let n = 1; n <= TOTAL; n++) {
+    const b = document.createElement("button"); b.textContent = n;
+    if (t.has(n)) b.disabled = true;
+    if (sel.includes(n)) b.className = "sel";
+    b.onclick = () => { if (sel.includes(n)) sel = sel.filter((x) => x !== n); else if (sel.length < room) sel.push(n); else flash(`Up to ${S.max} cards per player`); drawPicker(); };
+    box.append(b);
+  }
+  box.scrollTop = top;
+  $("prev").innerHTML = sel.map((n) => `<div class="card"><p class="cn">Card #${n}</p><div class="grid">${heads()}${cells(cardFor(n))}</div></div>`).join("");
+  $("join").disabled = !sel.length;
+  $("join").textContent = sel.length ? `Buy ${sel.map((n) => "#" + n).join(", ")} · ${sel.length * S.price} birr` : "Pick a card";
+}
+// ==END UI==
+$("jump").oninput = () => {
+  const n = parseInt($("jump").value), room = S.max - S.cards.length;
+  if (n >= 1 && n <= TOTAL && !S.taken.includes(n) && !sel.includes(n) && sel.length < room) sel.push(n);
+  if (n >= 1 && n <= TOTAL) { pk = ""; drawPicker(); $("nums").children[n - 1].scrollIntoView({ block: "center" }); }
+};
+$("join").onclick = () => ws.send(JSON.stringify({ type: "join", cards: sel }));
+
+async function loadMe() {
+  try {
+    info = await api("/api/me"); $("bal").textContent = info.balance;
+    $("tbNum").textContent = info.tb.number; $("tbName").textContent = info.tb.name;
+  } catch (e) { $("status").textContent = e.message; }
+}
+$("pSend").onclick = async () => {
+  $("pMsg").textContent = "Checking…";
+  try { const r = await api("/api/promo", { code: $("pCode").value }); $("bal").textContent = r.balance; $("pMsg").textContent = `+${r.amount} birr added!`; $("pCode").value = ""; }
+  catch (e) { $("pMsg").textContent = e.message; }
+};
+
+const show = (p) => { $("pgPlay").hidden = p !== "play"; $("pgProfile").hidden = p !== "prof"; $("tPlay").className = p === "play" ? "on" : ""; $("tProf").className = p === "prof" ? "on" : ""; if (p === "prof") loadHist(); scrollTo(0, 0); };
+$("tPlay").onclick = () => show("play"); $("tProf").onclick = () => show("prof");
+const u = tg.initDataUnsafe?.user || {};
+$("pName").textContent = [u.first_name, u.last_name].filter(Boolean).join(" ") || "Player";
+$("pId").textContent = u.id ? "Telegram ID " + u.id : "";
+$("av").textContent = (u.first_name || "P")[0].toUpperCase();
+async function loadHist() {
+  try {
+    const r = await api("/api/history");
+    $("hist2").innerHTML = r.items.length ? r.items.map((i) => `<div class="hr"><span>${i.kind} ${i.amount} birr</span><b class="${i.status}">${i.status}</b></div>`).join("") : '<p class="mute">No deposits or withdrawals yet.</p>';
+  } catch {}
+}
+$("dSend").onclick = async () => {
+  $("dMsg").textContent = "Sending…";
+  try {
+    await api("/api/deposit", { amount: $("dAmt").value, txId: $("dTx").value });
+    $("dMsg").textContent = "Sent. You'll get a message when it's approved.";
+    $("dAmt").value = $("dTx").value = ""; loadHist();
+  } catch (e) { $("dMsg").textContent = e.message; }
+};
+$("wSend").onclick = async () => {
+  $("wMsg").textContent = "Sending…";
+  try {
+    const r = await api("/api/withdraw", { amount: $("wAmt").value, phone: $("wPh").value });
+    $("bal").textContent = r.balance; $("wMsg").textContent = "Requested. You'll be paid on Telebirr after review."; loadHist();
+  } catch (e) { $("wMsg").textContent = e.message; }
+};
+
+loadMe(); connect();
+</script></body></html>
