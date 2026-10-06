@@ -1205,4 +1205,978 @@ app.get(
 );
 
 // Root fallback
-           
+app.get(
+  "/api/health",
+  (req, res) => {
+    res.status(200).json({
+      ok: true
+    });
+  }
+);
+
+// ---------------------------------------------------------
+// Authentication middleware
+// ---------------------------------------------------------
+
+const auth = (
+  req,
+  res,
+  next
+) => {
+  const u =
+    verify(
+      req.get("x-init")
+    );
+
+  if (!u) {
+    return res
+      .status(401)
+      .json({
+        error:
+          "Open this app from Telegram"
+      });
+  }
+
+  req.user =
+    u;
+
+  next();
+};
+
+// ---------------------------------------------------------
+// User information
+// ---------------------------------------------------------
+
+app.get(
+  "/api/me",
+  auth,
+  async (req, res) => {
+    try {
+      const balance =
+        await upsert(
+          req.user
+        );
+
+      res.json({
+        balance,
+
+        tb: {
+          number:
+            TELEBIRR_NUMBER ||
+            "0982372677",
+
+          name:
+            TELEBIRR_NAME ||
+            "Telebirr account"
+        },
+
+        price:
+          CARD_PRICE,
+
+        minDeposit:
+          MIN_DEPOSIT,
+
+        minWithdraw:
+          MIN_WITHDRAW
+      });
+    } catch (e) {
+      console.error(
+        "GET /api/me:",
+        e
+      );
+
+      res.status(500).json({
+        error:
+          "Server error"
+      });
+    }
+  }
+);
+
+// ---------------------------------------------------------
+// Deposit
+// ---------------------------------------------------------
+
+app.post(
+  "/api/deposit",
+  auth,
+  async (req, res) => {
+    const amount =
+      parseInt(
+        req.body.amount
+      );
+
+    const tx =
+      String(
+        req.body.txId ||
+          ""
+      )
+        .trim()
+        .toUpperCase();
+
+    if (
+      !(amount >=
+        MIN_DEPOSIT)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            `Minimum deposit is ${MIN_DEPOSIT} birr`
+        });
+    }
+
+    if (
+      !/^[A-Z0-9]{10}$/.test(
+        tx
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Transaction ID must be 10 letters/numbers"
+        });
+    }
+
+    try {
+      await upsert(
+        req.user
+      );
+
+      const id = (
+        await db.query(
+          `
+          INSERT INTO deposits(
+            user_id,
+            amount,
+            tx_id
+          )
+
+          VALUES(
+            $1,
+            $2,
+            $3
+          )
+
+          RETURNING id
+          `,
+          [
+            req.user.id,
+            amount,
+            tx
+          ]
+        )
+      ).rows[0].id;
+
+      const kb =
+        new InlineKeyboard()
+          .text(
+            "✅ Approve",
+            `dep:ok:${id}`
+          )
+          .text(
+            "❌ Reject",
+            `dep:no:${id}`
+          );
+
+      bot.api
+        .sendMessage(
+          ADMIN_ID,
+          `Deposit #${id}\n` +
+          `${req.user.first_name} (${req.user.id})\n` +
+          `Amount: ${amount} birr\n` +
+          `Tx: ${tx}\n` +
+          `${RECEIPT}${tx}`,
+          {
+            reply_markup:
+              kb
+          }
+        )
+        .catch(
+          console.error
+        );
+
+      res.json({
+        ok: true
+      });
+    } catch (e) {
+      if (
+        e.code ===
+        "23505"
+      ) {
+        return res
+          .status(409)
+          .json({
+            error:
+              "This transaction ID was already submitted"
+          });
+      }
+
+      console.error(
+        "Deposit error:",
+        e
+      );
+
+      res.status(500).json({
+        error:
+          "Server error"
+      });
+    }
+  }
+);
+
+// ---------------------------------------------------------
+// Withdrawal
+// ---------------------------------------------------------
+
+app.post(
+  "/api/withdraw",
+  auth,
+  async (req, res) => {
+    const amount =
+      parseInt(
+        req.body.amount
+      );
+
+    const phone =
+      String(
+        req.body.phone ||
+          ""
+      ).trim();
+
+    if (
+      !(amount >=
+        MIN_WITHDRAW)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            `Minimum withdrawal is ${MIN_WITHDRAW} birr`
+        });
+    }
+
+    if (
+      !/^(09|07|\+2519|\+2517)\d{8}$/.test(
+        phone
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Enter a valid Telebirr phone number"
+        });
+    }
+
+    try {
+      const b = (
+        await db.query(
+          `
+          UPDATE users
+
+          SET balance =
+            balance - $1
+
+          WHERE id = $2
+            AND balance >= $1
+
+          RETURNING balance
+          `,
+          [
+            amount,
+            req.user.id
+          ]
+        )
+      ).rows[0];
+
+      if (!b) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Not enough balance"
+          });
+      }
+
+      const id = (
+        await db.query(
+          `
+          INSERT INTO withdrawals(
+            user_id,
+            amount,
+            phone
+          )
+
+          VALUES(
+            $1,
+            $2,
+            $3
+          )
+
+          RETURNING id
+          `,
+          [
+            req.user.id,
+            amount,
+            phone
+          ]
+        )
+      ).rows[0].id;
+
+      const kb =
+        new InlineKeyboard()
+          .text(
+            "✅ Mark paid",
+            `wd:paid:${id}`
+          )
+          .text(
+            "❌ Reject",
+            `wd:no:${id}`
+          );
+
+      bot.api
+        .sendMessage(
+          ADMIN_ID,
+          `Withdrawal #${id}\n` +
+          `${req.user.first_name} (${req.user.id})\n` +
+          `Amount: ${amount} birr\n` +
+          `Telebirr: ${phone}`,
+          {
+            reply_markup:
+              kb
+          }
+        )
+        .catch(
+          console.error
+        );
+
+      res.json({
+        ok: true,
+        balance:
+          b.balance
+      });
+    } catch (e) {
+      console.error(
+        "Withdrawal error:",
+        e
+      );
+
+      res.status(500).json({
+        error:
+          "Server error"
+      });
+    }
+  }
+);
+
+// ---------------------------------------------------------
+// History
+// ---------------------------------------------------------
+
+app.get(
+  "/api/history",
+  auth,
+  async (req, res) => {
+    try {
+      const r =
+        await db.query(
+          `
+          SELECT
+            'Deposit' AS kind,
+            amount,
+            status,
+            created_at
+
+          FROM deposits
+
+          WHERE user_id = $1
+
+          UNION ALL
+
+          SELECT
+            'Withdrawal',
+            amount,
+            status,
+            created_at
+
+          FROM withdrawals
+
+          WHERE user_id = $1
+
+          ORDER BY created_at DESC
+
+          LIMIT 15
+          `,
+          [
+            req.user.id
+          ]
+        );
+
+      res.json({
+        items:
+          r.rows
+      });
+    } catch (e) {
+      console.error(
+        "History error:",
+        e
+      );
+
+      res.status(500).json({
+        error:
+          "Server error"
+      });
+    }
+  }
+);
+
+// ---------------------------------------------------------
+// Promo
+// ---------------------------------------------------------
+
+const tries =
+  new Map();
+
+app.post(
+  "/api/promo",
+  auth,
+  async (req, res) => {
+    const code =
+      String(
+        req.body.code ||
+          ""
+      )
+        .trim()
+        .toUpperCase();
+
+    const recent =
+      (
+        tries.get(
+          req.user.id
+        ) || []
+      ).filter(
+        (t) =>
+          Date.now() -
+            t <
+          60000
+      );
+
+    if (
+      recent.length >= 8
+    ) {
+      return res
+        .status(429)
+        .json({
+          error:
+            "Too many tries. Wait a minute."
+        });
+    }
+
+    tries.set(
+      req.user.id,
+      [
+        ...recent,
+        Date.now()
+      ]
+    );
+
+    if (
+      !/^[A-Z0-9]{3,20}$/.test(
+        code
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Invalid promo code"
+        });
+    }
+
+    const c =
+      await db.connect();
+
+    const fail = (m) => {
+      throw Object.assign(
+        new Error(m),
+        {
+          user: true
+        }
+      );
+    };
+
+    try {
+      await c.query(
+        "BEGIN"
+      );
+
+      const p = (
+        await c.query(
+          `
+          SELECT *
+          FROM promos
+          WHERE code = $1
+          FOR UPDATE
+          `,
+          [code]
+        )
+      ).rows[0];
+
+      if (
+        !p ||
+        !p.active ||
+        (
+          p.expires_at &&
+          p.expires_at <
+            new Date()
+        )
+      ) {
+        fail(
+          "Invalid or expired promo code"
+        );
+      }
+
+      if (
+        p.used >=
+        p.max_uses
+      ) {
+        fail(
+          "This promo code has been fully used"
+        );
+      }
+
+      if (
+        REQUIRE_DEPOSIT &&
+        !(
+          await c.query(
+            `
+            SELECT 1
+            FROM deposits
+
+            WHERE user_id = $1
+              AND status = 'approved'
+
+            LIMIT 1
+            `,
+            [
+              req.user.id
+            ]
+          )
+        ).rowCount
+      ) {
+        fail(
+          "Make your first approved deposit to use promo codes"
+        );
+      }
+
+      if (
+        !(
+          await c.query(
+            `
+            INSERT INTO promo_uses(
+              code,
+              user_id
+            )
+
+            VALUES(
+              $1,
+              $2
+            )
+
+            ON CONFLICT DO NOTHING
+            `,
+            [
+              code,
+              req.user.id
+            ]
+          )
+        ).rowCount
+      ) {
+        fail(
+          "You already used this code"
+        );
+      }
+
+      await c.query(
+        `
+        UPDATE promos
+
+        SET used =
+          used + 1
+
+        WHERE code = $1
+        `,
+        [code]
+      );
+
+      const b = (
+        await c.query(
+          `
+          UPDATE users
+
+          SET balance =
+            balance + $1
+
+          WHERE id = $2
+
+          RETURNING balance
+          `,
+          [
+            p.amount,
+            req.user.id
+          ]
+        )
+      ).rows[0];
+
+      await c.query(
+        "COMMIT"
+      );
+
+      pushBalance(
+        req.user.id,
+        b.balance
+      );
+
+      res.json({
+        ok: true,
+        amount:
+          p.amount,
+        balance:
+          b.balance
+      });
+    } catch (e) {
+      await c
+        .query(
+          "ROLLBACK"
+        )
+        .catch(() => {});
+
+      if (e.user) {
+        return res
+          .status(400)
+          .json({
+            error:
+              e.message
+          });
+      }
+
+      console.error(
+        "Promo error:",
+        e
+      );
+
+      res.status(500).json({
+        error:
+          "Server error"
+      });
+    } finally {
+      c.release();
+    }
+  }
+);
+
+// ---------------------------------------------------------
+// HTTP + WebSocket server
+// ---------------------------------------------------------
+
+const server =
+  createServer(app);
+
+const wss =
+  new WebSocketServer({
+    server,
+    path: "/ws"
+  });
+
+wss.on(
+  "connection",
+  (ws) => {
+    clients.add(ws);
+
+    ws.isAlive = true;
+
+    ws.on(
+      "pong",
+      () => {
+        ws.isAlive = true;
+      }
+    );
+
+    ws.on(
+      "close",
+      () => {
+        clients.delete(ws);
+      }
+    );
+
+    ws.on(
+      "error",
+      (err) => {
+        console.error(
+          "WebSocket error:",
+          err.message
+        );
+      }
+    );
+
+    ws.on(
+      "message",
+      async (raw) => {
+        let m;
+
+        try {
+          m = JSON.parse(
+            raw.toString()
+          );
+        } catch {
+          return;
+        }
+
+        // ---------------- Auth ----------------
+
+        if (
+          m.type === "auth"
+        ) {
+          try {
+            const u =
+              verify(
+                m.initData
+              );
+
+            if (!u) {
+              ws.close();
+              return;
+            }
+
+            ws.uid =
+              u.id;
+
+            ws.name =
+              u.first_name ||
+              "Player";
+
+            const balance =
+              await upsert(u);
+
+            send(
+              ws,
+              {
+                type:
+                  "balance",
+                balance
+              }
+            );
+
+            send(
+              ws,
+              view(
+                u.id
+              )
+            );
+          } catch (e) {
+            console.error(
+              "WebSocket auth error:",
+              e
+            );
+
+            ws.close();
+          }
+
+          return;
+        }
+
+        if (!ws.uid) {
+          return;
+        }
+
+        // ---------------- Game messages ----------------
+
+        try {
+          if (
+            m.type ===
+            "join"
+          ) {
+            await join(
+              ws,
+              m.cards
+            );
+          }
+        } catch (e) {
+          console.error(
+            "WebSocket message error:",
+            e
+          );
+
+          send(
+            ws,
+            {
+              type:
+                "error",
+              msg:
+                "Server error"
+            }
+          );
+        }
+      }
+    );
+  }
+);
+
+// ---------------------------------------------------------
+// WebSocket heartbeat
+// ---------------------------------------------------------
+
+const wsHeartbeat =
+  setInterval(() => {
+    wss.clients.forEach(
+      (ws) => {
+        if (
+          ws.isAlive ===
+          false
+        ) {
+          clients.delete(
+            ws
+          );
+
+          return ws.terminate();
+        }
+
+        ws.isAlive =
+          false;
+
+        ws.ping();
+      }
+    );
+  }, 30000);
+
+// ---------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------
+
+async function shutdown(
+  signal
+) {
+  console.log(
+    `${signal} received. Shutting down...`
+  );
+
+  clearInterval(
+    timer
+  );
+
+  clearInterval(
+    wsHeartbeat
+  );
+
+  try {
+    bot.stop();
+
+    wss.close();
+
+    await new Promise(
+      (resolve) => {
+        server.close(
+          resolve
+        );
+      }
+    );
+
+    await db.end();
+
+    console.log(
+      "Shutdown complete"
+    );
+
+    process.exit(0);
+  } catch (e) {
+    console.error(
+      "Shutdown error:",
+      e
+    );
+
+    process.exit(1);
+  }
+}
+
+process.on(
+  "SIGTERM",
+  () =>
+    shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () =>
+    shutdown("SIGINT")
+);
+
+// ---------------------------------------------------------
+// START APPLICATION
+// ---------------------------------------------------------
+
+async function start() {
+  try {
+    console.log(
+      "Starting Bingo application..."
+    );
+
+    console.log(
+      `Railway PORT: ${PORT}`
+    );
+
+    // Database first
+    await initDatabase();
+
+    // Initialize first game
+    reset();
+
+    // Start Telegram bot
+    bot.start({
+      onStart: (info) => {
+        console.log(
+          `Telegram bot started: @${info.username}`
+        );
+      }
+    }).catch((err) => {
+      console.error(
+        "Telegram bot stopped:",
+        err
+      );
+    });
+
+    // IMPORTANT:
+    // Railway requires the server to listen
+    // on 0.0.0.0 and its assigned PORT.
+    server.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `Bingo running on ${PORT}`
+        );
+
+        console.log(
+          `Health check: /health`
+        );
+      }
+    );
+  } catch (err) {
+    console.error(
+      "FATAL STARTUP ERROR:"
+    );
+
+    console.error(
+      err
+    );
+
+    try {
+      await db.end();
+    } catch {}
+
+    process.exit(1);
+  }
+}
+
+start();
