@@ -1,6 +1,6 @@
 // ============================================================
 // BINGO TELEGRAM MINI APP SERVER
-// Updated: 2026-10-06 (ESM + static frontend + fixes)
+// Updated: 2026-10-06 (ESM + diagnostics + fixes)
 // ============================================================
 
 console.log("🔥 BINGO SERVER NEW VERSION 2026-10-06");
@@ -46,6 +46,27 @@ const MAX_CARDS_PER_USER = Number(process.env.MAX_CARDS_PER_USER || 500);
 const CALL_INTERVAL_MS = Number(process.env.CALL_INTERVAL_MS || 3000);
 
 // ============================================================
+// ENV DIAGNOSTICS
+// ============================================================
+
+if (!DATABASE_URL) {
+  console.error("❌ DATABASE_URL is missing");
+} else {
+  console.log("✅ DATABASE_URL is set");
+}
+
+if (!BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN is missing — auth will always fail");
+} else {
+  console.log(
+    `✅ BOT_TOKEN is set (length=${BOT_TOKEN.length}, prefix=${BOT_TOKEN.slice(
+      0,
+      10
+    )}...)`
+  );
+}
+
+// ============================================================
 // EXPRESS
 // ============================================================
 
@@ -70,10 +91,6 @@ const server = http.createServer(app);
 // ============================================================
 // POSTGRESQL
 // ============================================================
-
-if (!DATABASE_URL) {
-  console.error("❌ DATABASE_URL is missing");
-}
 
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
@@ -371,7 +388,6 @@ app.use("/api", generalLimiter);
 // LANDING / HEALTH
 // ============================================================
 
-// Debug/status page (not the Mini App)
 app.get("/debug", (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -388,6 +404,7 @@ app.get("/debug", (req, res) => {
           padding: 40px;
         }
         .ok { color: #00ff88; }
+        .bad { color: #ff5566; }
         code { background:#222; padding:2px 6px; border-radius:4px; }
       </style>
     </head>
@@ -395,6 +412,8 @@ app.get("/debug", (req, res) => {
       <h1>🎱 Bingo Server</h1>
       <p class="ok">Server is running</p>
       <p>Telegram Bot: ${ENABLE_BOT ? "Enabled" : "Disabled"}</p>
+      <p>BOT_TOKEN: ${BOT_TOKEN ? '<span class="ok">set</span>' : '<span class="bad">missing</span>'}</p>
+      <p>DATABASE_URL: ${DATABASE_URL ? '<span class="ok">set</span>' : '<span class="bad">missing</span>'}</p>
       <p>Health: <code>/health</code></p>
       <p>Mini App: <code>/</code></p>
     </body>
@@ -409,6 +428,7 @@ app.get("/health", async (req, res) => {
       ok: true,
       server: "running",
       database: "connected",
+      botToken: !!BOT_TOKEN,
       botPolling: ENABLE_BOT,
       port: PORT,
       time: new Date().toISOString()
@@ -1327,7 +1347,7 @@ app.get("/api/bingo/round", authMiddleware, (req, res) => {
 // SPA FALLBACK — serve Mini App for any non-API route
 // ============================================================
 
-app.get("*", (req, res, next) => {
+app.use((req, res, next) => {
   if (req.path.startsWith("/api") || req.path.startsWith("/ws")) {
     return next();
   }
