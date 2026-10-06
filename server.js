@@ -1,3025 +1,2230 @@
-"use strict";
+import express from "express";
+import { createServer } from "http";
+import { WebSocketServer } from "ws";
+import { Bot, InlineKeyboard } from "grammy";
+import pg from "pg";
+import crypto from "crypto";
+import { cardFor, TOTAL } from "./public/cards.js";
 
-/*
-  BINGO TELEGRAM MINI APP SERVER
-  --------------------------------
-  Railway + PostgreSQL + Express + WebSocket + Grammy
+const {
+  BOT_TOKEN,
+  ADMIN_ID,
+  DATABASE_URL,
+  TELEBIRR_NUMBER,
+  TELEBIRR_NAME,
+  PORT = 3000,
+  ENABLE_BOT = "false",
+} = process.env;
 
-  Important:
-  - Railway PORT is used automatically.
-  - Server binds to 0.0.0.0.
-  - PostgreSQL uses DATABASE_URL.
-  - Telegram 409 polling conflicts DO NOT crash Node.
-  - WebSocket remains available.
-  - Bingo game continues running.
-*/
+const BOT_ENABLED = String(ENABLE_BOT).toLowerCase() === "true";
 
-const express = require("express");
-const http = require("http");
-const crypto = require("crypto");
-const { WebSocketServer } = require("ws");
-const { Pool } = require("pg");
-const { Bot } = require("grammy");
-
-
-// ============================================================
-// ENVIRONMENT
-// ============================================================
-
-const PORT = Number(process.env.PORT) || 8080;
-
-const DATABASE_URL = process.env.DATABASE_URL;
-
-const BOT_TOKEN = process.env.BOT_TOKEN;
-
-const ADMIN_ID = Number(process.env.ADMIN_ID || 0);
-
-const TELEBIRR_NUMBER =
-  process.env.TELEBIRR_NUMBER || "";
-
-const TELEBIRR_NAME =
-  process.env.TELEBIRR_NAME || "Telebirr";
-
-const CARD_PRICE =
-  Number(process.env.CARD_PRICE || 10);
-
-const HOUSE_CUT =
-  Number(process.env.HOUSE_CUT || 0.20);
-
-const MIN_PLAYERS =
-  Number(process.env.MIN_PLAYERS || 1);
-
-const BOTS =
-  Number(process.env.BOTS || 100);
+const CARD_PRICE = 10;
+const HOUSE_CUT = 0.2;
+const MIN_DEPOSIT = 10;
+const MIN_WITHDRAW = 50;
 
 const REQUIRE_DEPOSIT =
-  String(process.env.REQUIRE_DEPOSIT || "false").toLowerCase() === "true";
+  process.env.PROMO_REQUIRE_DEPOSIT !== "false";
 
-const PROMO_REQUIRE_DEPOSIT =
-  String(process.env.PROMO_REQUIRE_DEPOSIT || "false").toLowerCase() === "true";
+const MIN_PLAYERS = 2;
+const LOBBY_SECS = 30;
+const DRAW_MS = 4000;
 
+const MAX_CARDS = 4;
+const BOTS = Number(process.env.BOTS ?? 100);
 
-// ============================================================
-// VALIDATION
-// ============================================================
+const RECEIPT =
+  "https://transactioninfo.ethiotelecom.et/receipt/";
+
+/* =========================================================
+   DATABASE
+========================================================= */
 
 if (!DATABASE_URL) {
   console.error("❌ DATABASE_URL is missing");
-  process.exit(1);
 }
 
-if (!BOT_TOKEN) {
-  console.error("❌ BOT_TOKEN is missing");
-  process.exit(1);
-}
-
-
-// ============================================================
-// EXPRESS
-// ============================================================
-
-const app = express();
-
-app.disable("x-powered-by");
-
-app.use(express.json({ limit: "1mb" }));
-
-app.use(express.urlencoded({
-  extended: true,
-  limit: "1mb"
-}));
-
-
-// ============================================================
-// HTTP SERVER
-// ============================================================
-
-const server = http.createServer(app);
-
-
-// ============================================================
-// WEBSOCKET
-// ============================================================
-
-const wss = new WebSocketServer({
-  server,
-  path: "/ws"
-});
-
-
-// ============================================================
-// POSTGRESQL
-// ============================================================
-
-const pool = new Pool({
+const db = new pg.Pool({
   connectionString: DATABASE_URL,
-
-  ssl: DATABASE_URL.includes("railway.internal")
+  ssl: DATABASE_URL?.includes("railway.internal")
     ? false
-    : {
-        rejectUnauthorized: false
-      },
-
-  max: 10,
-
-  idleTimeoutMillis: 30000,
-
-  connectionTimeoutMillis: 10000
+    : { rejectUnauthorized: false },
 });
 
 let dbReady = false;
 
-
-// ============================================================
-// DATABASE INITIALIZATION
-// ============================================================
-
 async function initDatabase() {
-
-  console.log("📦 Initializing PostgreSQL...");
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users(
       id BIGINT PRIMARY KEY,
-      username TEXT,
-      first_name TEXT,
-      balance NUMERIC(18,2) NOT NULL DEFAULT 0,
-      total_deposit NUMERIC(18,2) NOT NULL DEFAULT 0,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      name TEXT,
+      balance INT NOT NULL DEFAULT 0 CHECK(balance >= 0)
     );
 
-    CREATE TABLE IF NOT EXISTS deposits (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      amount NUMERIC(18,2) NOT NULL,
-      reference TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      approved_at TIMESTAMPTZ
+    CREATE TABLE IF NOT EXISTS deposits(
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT,
+      amount INT,
+      tx_id TEXT UNIQUE,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT now()
     );
 
-    CREATE TABLE IF NOT EXISTS withdrawals (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      amount NUMERIC(18,2) NOT NULL,
-      destination TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      processed_at TIMESTAMPTZ
+    CREATE TABLE IF NOT EXISTS withdrawals(
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT,
+      amount INT,
+      phone TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT now()
     );
 
-    CREATE TABLE IF NOT EXISTS promos (
+    CREATE TABLE IF NOT EXISTS promos(
       code TEXT PRIMARY KEY,
-      amount NUMERIC(18,2) NOT NULL DEFAULT 0,
-      max_uses INTEGER NOT NULL DEFAULT 1,
-      uses INTEGER NOT NULL DEFAULT 0,
-      require_deposit BOOLEAN NOT NULL DEFAULT false,
+      amount INT NOT NULL,
+      max_uses INT NOT NULL,
+      used INT NOT NULL DEFAULT 0,
+      active BOOL NOT NULL DEFAULT true,
       expires_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT now()
     );
 
-    CREATE TABLE IF NOT EXISTS promo_uses (
-      code TEXT NOT NULL,
-      user_id BIGINT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CREATE TABLE IF NOT EXISTS promo_uses(
+      code TEXT,
+      user_id BIGINT,
+      used_at TIMESTAMPTZ DEFAULT now(),
       PRIMARY KEY(code, user_id)
     );
-
-    CREATE INDEX IF NOT EXISTS idx_deposits_status
-      ON deposits(status);
-
-    CREATE INDEX IF NOT EXISTS idx_withdrawals_status
-      ON withdrawals(status);
-
-    CREATE INDEX IF NOT EXISTS idx_promo_uses_user
-      ON promo_uses(user_id);
   `);
 
-  console.log("✅ PostgreSQL ready");
-
   dbReady = true;
+  console.log("🗄️ PostgreSQL ready");
 }
 
+/* =========================================================
+   TELEGRAM MINI APP AUTH
+========================================================= */
 
-// ============================================================
-// TELEGRAM BOT
-// ============================================================
-
-const bot = new Bot(BOT_TOKEN);
-
-let botRunning = false;
-let botStarting = false;
-
-
-// ============================================================
-// SAFE TELEGRAM BOT START
-// ============================================================
-
-async function startTelegramBot() {
-
-  if (botStarting || botRunning) {
-    return;
-  }
-
-  botStarting = true;
-
+function verify(initData) {
   try {
+    if (!BOT_TOKEN || !initData) return null;
 
-    /*
-      Drop any webhook before getUpdates polling.
+    const p = new URLSearchParams(initData);
 
-      This is safe for this architecture because
-      the bot uses long polling.
-    */
+    const hash = p.get("hash");
+    if (!hash) return null;
+
+    p.delete("hash");
+
+    const str = [...p.entries()]
+      .map(([k, v]) => `${k}=${v}`)
+      .sort()
+      .join("\n");
+
+    const key = crypto
+      .createHmac("sha256", "WebAppData")
+      .update(BOT_TOKEN)
+      .digest();
+
+    const calc = crypto
+      .createHmac("sha256", key)
+      .update(str)
+      .digest("hex");
+
+    if (calc !== hash) return null;
+
+    const authDate = Number(p.get("auth_date"));
+
+    if (!authDate) return null;
+
+    if (Date.now() / 1000 - authDate > 86400) {
+      return null;
+    }
+
+    const user = JSON.parse(p.get("user"));
+
+    return user;
+  } catch {
+    return null;
+  }
+}
+
+async function upsert(u) {
+  const r = await db.query(
+    `
+    INSERT INTO users(id, name)
+    VALUES($1, $2)
+    ON CONFLICT(id)
+    DO UPDATE SET name=$2
+    RETURNING balance
+    `,
+    [u.id, u.first_name || "Player"]
+  );
+
+  return r.rows[0].balance;
+}
+
+/* =========================================================
+   TELEGRAM BOT
+========================================================= */
+
+let bot = null;
+let botPollingStarted = false;
+
+if (BOT_TOKEN) {
+  bot = new Bot(BOT_TOKEN);
+} else {
+  console.warn("⚠️ BOT_TOKEN is missing");
+}
+
+const isAdmin = (ctx) =>
+  String(ctx.from?.id) === String(ADMIN_ID);
+
+const tell = (id, text) => {
+  if (!bot) return Promise.resolve();
+
+  return bot.api
+    .sendMessage(id, text)
+    .catch((e) =>
+      console.error("Telegram sendMessage error:", e.message)
+    );
+};
+
+/* =========================================================
+   BOT COMMANDS
+========================================================= */
+
+if (bot) {
+  bot.command("start", async (ctx) => {
+    await ctx.reply(
+      "Welcome to Bingo! Tap the Play button to start."
+    );
+  });
+
+  bot.command("newpromo", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+
+    const [code, amount, max, days] =
+      ctx.match.trim().split(/\s+/);
+
+    const a = parseInt(amount);
+    const m = parseInt(max);
+    const d = parseInt(days);
+
+    if (
+      !/^[A-Za-z0-9]{3,20}$/.test(code || "") ||
+      !(a > 0) ||
+      !(m > 0)
+    ) {
+      return ctx.reply(
+        "Usage: /newpromo CODE BIRR MAX_USES [DAYS]\n" +
+        "Example: /newpromo WELCOME20 20 100 7"
+      );
+    }
 
     try {
-      await bot.api.deleteWebhook({
-        drop_pending_updates: false
-      });
+      if (d > 0) {
+        await db.query(
+          `
+          INSERT INTO promos(
+            code,
+            amount,
+            max_uses,
+            expires_at
+          )
+          VALUES(
+            $1,
+            $2,
+            $3,
+            now() + make_interval(days => $4)
+          )
+          `,
+          [code.toUpperCase(), a, m, d]
+        );
+      } else {
+        await db.query(
+          `
+          INSERT INTO promos(
+            code,
+            amount,
+            max_uses
+          )
+          VALUES($1,$2,$3)
+          `,
+          [code.toUpperCase(), a, m]
+        );
+      }
 
-      console.log("✅ Telegram webhook cleared");
-    } catch (err) {
-      console.error(
-        "⚠️ Could not clear Telegram webhook:",
-        err.message
+      await ctx.reply(
+        `✅ Promo ${code.toUpperCase()}: ${a} birr, ` +
+        `${m} uses` +
+        (d > 0 ? `, expires in ${d} days` : "")
+      );
+    } catch (e) {
+      await ctx.reply(
+        e.code === "23505"
+          ? "That code already exists."
+          : "Error creating code."
       );
     }
+  });
 
+  bot.command("promos", async (ctx) => {
+    if (!isAdmin(ctx)) return;
 
-    console.log("🤖 Starting Telegram bot...");
+    const r = await db.query(
+      `
+      SELECT *
+      FROM promos
+      ORDER BY created_at DESC
+      LIMIT 20
+      `
+    );
 
+    if (!r.rows.length) {
+      return ctx.reply("No promo codes yet.");
+    }
 
-    /*
-      IMPORTANT:
+    await ctx.reply(
+      r.rows
+        .map(
+          (p) =>
+            `${p.code}: ${p.amount} birr, ` +
+            `${p.used}/${p.max_uses} used` +
+            `${p.active ? "" : " (stopped)"}` +
+            `${
+              p.expires_at
+                ? `, expires ${p.expires_at
+                    .toISOString()
+                    .slice(0, 10)}`
+                : ""
+            }`
+        )
+        .join("\n")
+    );
+  });
 
-      Do NOT await bot.start() forever.
+  bot.command("stoppromo", async (ctx) => {
+    if (!isAdmin(ctx)) return;
 
-      Also attach .catch() so Grammy 409 cannot
-      become an unhandled rejection/process crash.
-    */
+    const code = ctx.match
+      .trim()
+      .toUpperCase();
 
-    bot.start({
-      onStart: (info) => {
+    const r = await db.query(
+      `
+      UPDATE promos
+      SET active=false
+      WHERE code=$1
+      `,
+      [code]
+    );
 
-        botRunning = true;
+    await ctx.reply(
+      r.rowCount
+        ? "Promo stopped."
+        : "Code not found."
+    );
+  });
 
-        console.log(
-          `🤖 Telegram bot started: @${info.username}`
+  /* =======================================================
+     ADMIN CALLBACKS
+  ======================================================= */
+
+  bot.on("callback_query:data", async (ctx) => {
+    try {
+      if (!isAdmin(ctx)) {
+        return ctx.answerCallbackQuery(
+          "Not allowed"
         );
       }
-    })
-    .then(() => {
 
-      botRunning = false;
+      const [
+        kind,
+        act,
+        id,
+      ] = ctx.callbackQuery.data.split(":");
 
-      console.log(
-        "ℹ️ Telegram bot polling stopped."
-      );
+      let msg = "Already handled";
 
-    })
-    .catch((err) => {
+      /* ---------------- DEPOSIT APPROVE ---------------- */
 
-      botRunning = false;
+      if (kind === "dep" && act === "ok") {
+        const r = (
+          await db.query(
+            `
+            WITH d AS (
+              UPDATE deposits
+              SET status='approved'
+              WHERE id=$1
+              AND status='pending'
+              RETURNING user_id, amount
+            )
+            UPDATE users u
+            SET balance=u.balance+d.amount
+            FROM d
+            WHERE u.id=d.user_id
+            RETURNING
+              u.id,
+              d.amount,
+              u.balance
+            `,
+            [id]
+          )
+        ).rows[0];
 
-      const code =
-        err?.error_code ||
-        err?.errorCode;
+        if (r) {
+          msg = `✅ Approved ${r.amount} birr`;
 
-      const description =
-        err?.description ||
-        err?.message ||
-        "Unknown Telegram error";
-
-
-      if (code === 409) {
-
-        /*
-          MOST IMPORTANT FIX:
-
-          A second getUpdates consumer exists.
-
-          DO NOT throw.
-          DO NOT process.exit().
-          DO NOT crash Node.
-
-          Keep HTTP/WebSocket/PostgreSQL alive.
-        */
-
-        console.error("");
-        console.error(
-          "⚠️ TELEGRAM 409 CONFLICT"
-        );
-        console.error(
-          "Another instance is currently using this BOT_TOKEN."
-        );
-        console.error(
-          "Bingo HTTP/WebSocket/PostgreSQL will continue running."
-        );
-        console.error(
-          "Stop the other bot instance, then restart this service."
-        );
-        console.error("");
-
-        botStarting = false;
-
-        return;
-      }
-
-
-      console.error(
-        "❌ Telegram polling error:",
-        description
-      );
-
-      /*
-        Do not crash the application.
-
-        Reset the flag so a retry can happen.
-      */
-
-      botStarting = false;
-
-      setTimeout(() => {
-
-        if (!shuttingDown && dbReady) {
-          console.log(
-            "🔄 Retrying Telegram bot..."
+          await tell(
+            r.id,
+            `✅ Deposit of ${r.amount} birr approved.\n` +
+            `Balance: ${r.balance} birr.`
           );
 
-          startTelegramBot();
+          pushBalance(
+            r.id,
+            r.balance
+          );
         }
+      }
 
-      }, 10000);
-    });
+      /* ---------------- DEPOSIT REJECT ---------------- */
 
-  } catch (err) {
+      else if (kind === "dep") {
+        const r = (
+          await db.query(
+            `
+            UPDATE deposits
+            SET status='rejected'
+            WHERE id=$1
+            AND status='pending'
+            RETURNING user_id
+            `,
+            [id]
+          )
+        ).rows[0];
 
-    console.error(
-      "❌ Telegram startup error:",
-      err.message
-    );
+        if (r) {
+          msg = "❌ Rejected";
 
-  } finally {
+          await tell(
+            r.user_id,
+            "❌ Your deposit was rejected. " +
+            "Check the transaction ID and try again."
+          );
+        }
+      }
 
-    botStarting = false;
-  }
+      /* ---------------- WITHDRAW PAID ---------------- */
+
+      else if (
+        kind === "wd" &&
+        act === "paid"
+      ) {
+        const r = (
+          await db.query(
+            `
+            UPDATE withdrawals
+            SET status='paid'
+            WHERE id=$1
+            AND status='pending'
+            RETURNING user_id, amount
+            `,
+            [id]
+          )
+        ).rows[0];
+
+        if (r) {
+          msg = "✅ Marked paid";
+
+          await tell(
+            r.user_id,
+            `✅ ${r.amount} birr was sent to your Telebirr.`
+          );
+        }
+      }
+
+      /* ---------------- WITHDRAW REJECT ---------------- */
+
+      else if (kind === "wd") {
+        const r = (
+          await db.query(
+            `
+            WITH w AS (
+              UPDATE withdrawals
+              SET status='rejected'
+              WHERE id=$1
+              AND status='pending'
+              RETURNING user_id, amount
+            )
+            UPDATE users u
+            SET balance=u.balance+w.amount
+            FROM w
+            WHERE u.id=w.user_id
+            RETURNING
+              u.id,
+              u.balance
+            `,
+            [id]
+          )
+        ).rows[0];
+
+        if (r) {
+          msg = "❌ Rejected, refunded";
+
+          await tell(
+            r.id,
+            "❌ Withdrawal rejected.\n" +
+            "The amount was returned to your balance."
+          );
+
+          pushBalance(
+            r.id,
+            r.balance
+          );
+        }
+      }
+
+      await ctx.answerCallbackQuery(msg);
+
+      await ctx
+        .editMessageText(
+          `${ctx.callbackQuery.message?.text || ""}\n\n${msg}`
+        )
+        .catch(() => {});
+    } catch (e) {
+      console.error(
+        "Telegram callback error:",
+        e
+      );
+
+      await ctx
+        .answerCallbackQuery("Server error")
+        .catch(() => {});
+    }
+  });
 }
 
+/* =========================================================
+   BINGO GAME
+========================================================= */
 
-// ============================================================
-// TELEGRAM COMMANDS
-// ============================================================
-
-bot.command("start", async (ctx) => {
-
-  try {
-
-    const user = ctx.from;
-
-    await ensureUser(user);
-
-    await ctx.reply(
-      "🎱 Welcome to Bingo!\n\n" +
-      "Open the Bingo Mini App to play."
-    );
-
-  } catch (err) {
-
-    console.error(
-      "/start error:",
-      err.message
-    );
-
-  }
-});
-
-
-bot.command("balance", async (ctx) => {
-
-  try {
-
-    if (!ctx.from) return;
-
-    await ensureUser(ctx.from);
-
-    const result = await pool.query(
-      `SELECT balance
-       FROM users
-       WHERE id = $1`,
-      [ctx.from.id]
-    );
-
-    const balance =
-      Number(result.rows[0]?.balance || 0);
-
-    await ctx.reply(
-      `💰 Balance: ${balance.toFixed(2)} Birr`
-    );
-
-  } catch (err) {
-
-    console.error(
-      "/balance error:",
-      err.message
-    );
-
-  }
-});
-
-
-// ============================================================
-// ADMIN PROMO COMMAND
-// ============================================================
-
-bot.command("newpromo", async (ctx) => {
-
-  try {
-
-    if (!ADMIN_ID || ctx.from?.id !== ADMIN_ID) {
-      return;
-    }
-
-    const parts =
-      String(ctx.message?.text || "")
-        .trim()
-        .split(/\s+/);
-
-    /*
-      /newpromo CODE AMOUNT USES DAYS [deposit]
-
-      Example:
-
-      /newpromo BONUS100 100 50 30
-    */
-
-    if (parts.length < 5) {
-
-      await ctx.reply(
-        "Usage:\n" +
-        "/newpromo CODE AMOUNT USES DAYS"
-      );
-
-      return;
-    }
-
-    const code =
-      parts[1].toUpperCase();
-
-    const amount =
-      Number(parts[2]);
-
-    const maxUses =
-      Number(parts[3]);
-
-    const days =
-      Number(parts[4]);
-
-    if (
-      !code ||
-      !Number.isFinite(amount) ||
-      amount <= 0 ||
-      !Number.isInteger(maxUses) ||
-      maxUses <= 0 ||
-      !Number.isFinite(days) ||
-      days <= 0
-    ) {
-
-      await ctx.reply(
-        "❌ Invalid promo parameters."
-      );
-
-      return;
-    }
-
-    const expiresAt =
-      new Date(
-        Date.now() +
-        days * 24 * 60 * 60 * 1000
-      );
-
-    await pool.query(
-      `
-      INSERT INTO promos
-        (code, amount, max_uses, require_deposit, expires_at)
-      VALUES
-        ($1, $2, $3, $4, $5)
-      ON CONFLICT (code)
-      DO UPDATE SET
-        amount = EXCLUDED.amount,
-        max_uses = EXCLUDED.max_uses,
-        require_deposit = EXCLUDED.require_deposit,
-        expires_at = EXCLUDED.expires_at
-      `,
-      [
-        code,
-        amount,
-        maxUses,
-        PROMO_REQUIRE_DEPOSIT,
-        expiresAt
-      ]
-    );
-
-    await ctx.reply(
-      `✅ Promo created\n\n` +
-      `Code: ${code}\n` +
-      `Amount: ${amount} Birr\n` +
-      `Uses: ${maxUses}\n` +
-      `Expires: ${expiresAt.toISOString()}`
-    );
-
-  } catch (err) {
-
-    console.error(
-      "/newpromo error:",
-      err.message
-    );
-
-  }
-});
-
-
-// ============================================================
-// USER DATABASE
-// ============================================================
-
-async function ensureUser(user) {
-
-  if (!user?.id) {
-    throw new Error("Invalid Telegram user");
-  }
-
-  await pool.query(
-    `
-    INSERT INTO users
-      (id, username, first_name)
-    VALUES
-      ($1, $2, $3)
-    ON CONFLICT (id)
-    DO UPDATE SET
-      username = EXCLUDED.username,
-      first_name = EXCLUDED.first_name,
-      updated_at = NOW()
-    `,
-    [
-      user.id,
-      user.username || null,
-      user.first_name || null
-    ]
+const rnd = (a, b) =>
+  a +
+  Math.floor(
+    Math.random() *
+      (b - a + 1)
   );
-}
 
-
-// ============================================================
-// TELEGRAM MINI APP AUTH
-// ============================================================
-
-function verifyTelegramInitData(initData) {
-
-  if (!initData) {
-    return null;
-  }
-
-  try {
-
-    const params =
-      new URLSearchParams(initData);
-
-    const hash =
-      params.get("hash");
-
-    if (!hash) {
-      return null;
-    }
-
-    params.delete("hash");
-
-    const dataCheckString =
-      [...params.entries()]
-        .sort(([a], [b]) =>
-          a.localeCompare(b)
-        )
-        .map(([key, value]) =>
-          `${key}=${value}`
-        )
-        .join("\n");
-
-
-    const secretKey =
-      crypto
-        .createHmac(
-          "sha256",
-          "WebAppData"
-        )
-        .update(BOT_TOKEN)
-        .digest();
-
-
-    const calculatedHash =
-      crypto
-        .createHmac(
-          "sha256",
-          secretKey
-        )
-        .update(dataCheckString)
-        .digest("hex");
-
-
-    if (
-      calculatedHash.length !== hash.length ||
-      !crypto.timingSafeEqual(
-        Buffer.from(calculatedHash),
-        Buffer.from(hash)
-      )
-    ) {
-      return null;
-    }
-
-
-    const authDate =
-      Number(params.get("auth_date") || 0);
-
-
-    if (!authDate) {
-      return null;
-    }
-
-
-    /*
-      24-hour validation.
-    */
-
-    if (
-      Math.floor(Date.now() / 1000) -
-      authDate >
-      86400
-    ) {
-      return null;
-    }
-
-
-    const userJson =
-      params.get("user");
-
-    if (!userJson) {
-      return null;
-    }
-
-
-    return JSON.parse(userJson);
-
-  } catch (err) {
-
-    console.error(
-      "Telegram auth error:",
-      err.message
-    );
-
-    return null;
-  }
-}
-
-
-// ============================================================
-// AUTH MIDDLEWARE
-// ============================================================
-
-async function authMiddleware(req, res, next) {
-
-  if (!dbReady) {
-
-    return res.status(503).json({
-      ok: false,
-      error: "Server is starting"
-    });
-  }
-
-
-  const initData =
-    req.headers["x-telegram-init-data"] ||
-    req.headers["x-init-data"] ||
-    req.body?.initData;
-
-
-  const user =
-    verifyTelegramInitData(initData);
-
-
-  if (!user) {
-
-    return res.status(401).json({
-      ok: false,
-      error: "Invalid Telegram authentication"
-    });
-  }
-
-
-  try {
-
-    await ensureUser(user);
-
-    req.telegramUser = user;
-
-    next();
-
-  } catch (err) {
-
-    console.error(
-      "Auth error:",
-      err.message
-    );
-
-    res.status(500).json({
-      ok: false,
-      error: "Authentication failed"
-    });
-  }
-}
-
-
-// ============================================================
-// BINGO GAME
-// ============================================================
-
-let game = null;
-
-
-/*
-  Generate a standard 5x5 Bingo card.
-
-  Columns:
-  B: 1-15
-  I: 16-30
-  N: 31-45
-  G: 46-60
-  O: 61-75
-*/
-
-function shuffle(array) {
-
-  const a = [...array];
-
+const shuffle = (a) => {
   for (
     let i = a.length - 1;
     i > 0;
     i--
   ) {
-
-    const j =
-      Math.floor(
-        Math.random() * (i + 1)
-      );
+    const j = rnd(0, i);
 
     [
       a[i],
-      a[j]
+      a[j],
     ] = [
       a[j],
-      a[i]
+      a[i],
     ];
   }
 
   return a;
-}
-
-
-function createCard() {
-
-  const columns = [
-    [1, 15],
-    [16, 30],
-    [31, 45],
-    [46, 60],
-    [61, 75]
-  ];
-
-
-  const card = [];
-
-
-  for (let c = 0; c < 5; c++) {
-
-    const [
-      min,
-      max
-    ] = columns[c];
-
-    const nums =
-      shuffle(
-        Array.from(
-          {
-            length:
-              max - min + 1
-          },
-          (_, i) =>
-            min + i
-        )
-      )
-      .slice(0, 5);
-
-
-    card.push(nums);
-  }
-
-
-  /*
-    Convert columns → rows.
-  */
-
-  const rows =
-    Array.from(
-      { length: 5 },
-      (_, r) =>
-        Array.from(
-          { length: 5 },
-          (_, c) =>
-            card[c][r]
-        )
-    );
-
-
-  /*
-    Free center.
-  */
-
-  rows[2][2] = 0;
-
-  return rows;
-}
-
-
-function createGame() {
-
-  return {
-
-    roundId:
-      crypto.randomUUID(),
-
-    status: "lobby",
-
-    cards: new Map(),
-
-    taken: new Set(),
-
-    called: [],
-
-    calledSet: new Set(),
-
-    winner: null,
-
-    winners: [],
-
-    prize: 0,
-
-    createdAt: Date.now(),
-
-    countdownEndsAt: null,
-
-    nextCallAt: null,
-
-    timers: {
-      countdown: null,
-      calling: null,
-      finish: null
-    }
-  };
-}
-
-
-function resetGame() {
-
-  if (game?.timers) {
-
-    clearTimeout(
-      game.timers.countdown
-    );
-
-    clearTimeout(
-      game.timers.calling
-    );
-
-    clearTimeout(
-      game.timers.finish
-    );
-  }
-
-
-  game = createGame();
-
-  broadcastGame();
-
-  console.log(
-    `🎱 New Bingo round: ${game.roundId}`
-  );
-}
-
-
-resetGame();
-
-
-// ============================================================
-// CARD ID
-// ============================================================
-
-function randomCardId() {
-
-  let id;
-
-  do {
-
-    id =
-      Math.floor(
-        Math.random() * 1000000
-      )
-      .toString()
-      .padStart(6, "0");
-
-  } while (
-    game.taken.has(id)
-  );
-
-
-  return id;
-}
-
-
-// ============================================================
-// PLAYER CARD COUNT
-// ============================================================
-
-function cardCount() {
-
-  let count = 0;
-
-  for (const card of game.cards.values()) {
-
-    if (!card.bot) {
-      count++;
-    }
-  }
-
-  return count;
-}
-
-
-// ============================================================
-// PRIZE
-// ============================================================
-
-function calculatePrize() {
-
-  const total =
-    cardCount() *
-    CARD_PRICE;
-
-
-  return Math.floor(
-    total *
-    (1 - HOUSE_CUT)
-  );
-}
-
-
-// ============================================================
-// BINGO CHECK
-// ============================================================
-
-function hasBingo(card) {
-
-  const marked =
-    card.marked;
-
-
-  /*
-    Rows
-  */
-
-  for (let r = 0; r < 5; r++) {
-
-    let complete = true;
-
-    for (let c = 0; c < 5; c++) {
-
-      if (
-        card.numbers[r][c] !== 0 &&
-        !marked.has(
-          card.numbers[r][c]
-        )
-      ) {
-
-        complete = false;
-
-        break;
-      }
-    }
-
-
-    if (complete) {
-      return true;
-    }
-  }
-
-
-  /*
-    Columns
-  */
-
-  for (let c = 0; c < 5; c++) {
-
-    let complete = true;
-
-    for (let r = 0; r < 5; r++) {
-
-      if (
-        card.numbers[r][c] !== 0 &&
-        !marked.has(
-          card.numbers[r][c]
-        )
-      ) {
-
-        complete = false;
-
-        break;
-      }
-    }
-
-
-    if (complete) {
-      return true;
-    }
-  }
-
-
-  /*
-    Diagonal 1
-  */
-
-  let complete = true;
-
-  for (let i = 0; i < 5; i++) {
-
-    if (
-      card.numbers[i][i] !== 0 &&
-      !marked.has(
-        card.numbers[i][i]
-      )
-    ) {
-
-      complete = false;
-
-      break;
-    }
-  }
-
-
-  if (complete) {
-    return true;
-  }
-
-
-  /*
-    Diagonal 2
-  */
-
-  complete = true;
-
-  for (let i = 0; i < 5; i++) {
-
-    if (
-      card.numbers[i][4 - i] !== 0 &&
-      !marked.has(
-        card.numbers[i][4 - i]
-      )
-    ) {
-
-      complete = false;
-
-      break;
-    }
-  }
-
-
-  return complete;
-}
-
-
-// ============================================================
-// MARK CALLED NUMBER
-// ============================================================
-
-function markCard(card) {
-
-  for (
-    const number of game.called
-  ) {
-
-    if (number !== 0) {
-
-      card.marked.add(number);
-    }
-  }
-}
-
-
-// ============================================================
-// FIND WINNERS
-// ============================================================
-
-function findWinners() {
-
-  const winners = [];
-
-
-  for (
-    const card of game.cards.values()
-  ) {
-
-    if (card.bot) {
-      continue;
-    }
-
-
-    markCard(card);
-
-
-    if (hasBingo(card)) {
-
-      winners.push(card);
-    }
-  }
-
-
-  return winners;
-}
-
-
-// ============================================================
-// BROADCAST
-// ============================================================
-
-function publicGameState() {
-
-  return {
-
-    roundId:
-      game.roundId,
-
-    status:
-      game.status,
-
-    called:
-      game.called,
-
-    currentBall:
-      game.called[
-        game.called.length - 1
-      ] || null,
-
-    playerCount:
-      cardCount(),
-
-    prize:
-      calculatePrize(),
-
-    winner:
-      game.winner
-        ? {
-            userId:
-              game.winner.userId,
-
-            cardId:
-              game.winner.cardId
-          }
-        : null,
-
-    winners:
-      game.winners.map(w => ({
-        userId:
-          w.userId,
-
-        cardId:
-          w.cardId
-      })),
-
-    countdownEndsAt:
-      game.countdownEndsAt,
-
-    nextCallAt:
-      game.nextCallAt
-  };
-}
-
-
-function broadcastGame() {
-
-  const data =
-    JSON.stringify({
-      type: "game",
-      game: publicGameState()
-    });
-
-
-  for (
-    const ws of wss.clients
-  ) {
-
-    if (
-      ws.readyState === ws.OPEN
-    ) {
-
-      try {
-        ws.send(data);
-      } catch (err) {
-        console.error(
-          "WS send error:",
-          err.message
-        );
-      }
-    }
-  }
-}
-
-
-// ============================================================
-// START COUNTDOWN
-// ============================================================
-
-function startCountdown() {
-
-  if (
-    !game ||
-    game.status !== "lobby"
-  ) {
-    return;
-  }
-
-
-  if (
-    cardCount() < MIN_PLAYERS
-  ) {
-
-    console.log(
-      `Waiting for players: ${cardCount()}/${MIN_PLAYERS}`
-    );
-
-    return;
-  }
-
-
-  const seconds = 30;
-
-  game.countdownEndsAt =
-    Date.now() +
-    seconds * 1000;
-
-
-  broadcastGame();
-
-
-  clearTimeout(
-    game.timers.countdown
-  );
-
-
-  game.timers.countdown =
-    setTimeout(
-      () => {
-
-        if (
-          game.status !== "lobby"
-        ) {
-          return;
-        }
-
-
-        game.status = "calling";
-
-        game.countdownEndsAt = null;
-
-        game.called = [];
-
-        game.calledSet.clear();
-
-        game.winner = null;
-
-        game.winners = [];
-
-        game.prize =
-          calculatePrize();
-
-
-        broadcastGame();
-
-        callNextNumber();
-
-      },
-      seconds * 1000
-    );
-}
-
-
-// ============================================================
-// CALL NEXT NUMBER
-// ============================================================
-
-function callNextNumber() {
-
-  if (
-    game.status !== "calling"
-  ) {
-    return;
-  }
-
-
-  if (
-    game.called.length >= 75
-  ) {
-
-    finishRound();
-
-    return;
-  }
-
-
-  let number;
-
-  do {
-
-    number =
-      Math.floor(
-        Math.random() * 75
-      ) + 1;
-
-  } while (
-    game.calledSet.has(number)
-  );
-
-
-  game.called.push(number);
-
-  game.calledSet.add(number);
-
-  game.nextCallAt =
-    Date.now() + 3000;
-
-
-  broadcastGame();
-
-
-  const winners =
-    findWinners();
-
-
-  if (winners.length > 0) {
-
-    finishRound(winners);
-
-    return;
-  }
-
-
-  clearTimeout(
-    game.timers.calling
-  );
-
-
-  game.timers.calling =
-    setTimeout(
-      callNextNumber,
-      3000
-    );
-}
-
-
-// ============================================================
-// FINISH ROUND
-// ============================================================
-
-async function finishRound(
-  winners = []
-) {
-
-  if (
-    game.status === "finished"
-  ) {
-    return;
-  }
-
-
-  game.status = "finished";
-
-  game.nextCallAt = null;
-
-  game.winners = winners;
-
-  game.winner =
-    winners[0] || null;
-
-  game.prize =
-    calculatePrize();
-
-
-  broadcastGame();
-
-
-  console.log(
-    `🏆 Round finished. Winners: ${winners.length}`
-  );
-
-
-  /*
-    Pay winners.
-
-    Prize is divided equally.
-  */
-
-  if (
-    winners.length > 0 &&
-    game.prize > 0
-  ) {
-
-    const each =
-      Math.floor(
-        game.prize /
-        winners.length
-      );
-
-
-    if (each > 0) {
-
-      for (
-        const winner of winners
-      ) {
-
-        try {
-
-          await pool.query(
-            `
-            UPDATE users
-            SET
-              balance = balance + $1,
-              updated_at = NOW()
-            WHERE id = $2
-            `,
-            [
-              each,
-              winner.userId
-            ]
-          );
-
-        } catch (err) {
-
-          console.error(
-            "Winner payment error:",
-            err.message
-          );
-        }
-      }
-    }
-  }
-
-
-  /*
-    Winner popup remains visible
-    for approximately 3 seconds.
-  */
-
-  clearTimeout(
-    game.timers.finish
-  );
-
-
-  game.timers.finish =
-    setTimeout(
-      () => {
-
-        resetGame();
-
-      },
-      3000
-    );
-}
-
-
-// ============================================================
-// JOIN GAME
-// ============================================================
-
-async function joinGame(
-  userId,
-  requestedCards
-) {
-
-  if (
-    game.status !== "lobby"
-  ) {
-
-    throw new Error(
-      "Round is not accepting cards"
-    );
-  }
-
-
-  const cardsToBuy =
-    Math.max(
-      1,
-      Math.min(
-        Number(requestedCards) || 1,
-        20
-      )
-    );
-
-
-  const cost =
-    cardsToBuy *
-    CARD_PRICE;
-
-
-  /*
-    Reserve cards before DB await.
-  */
-
-  const cards = [];
-
+};
+
+const hasLine = (
+  card,
+  drawn
+) => {
+  const ok = (v) =>
+    v === 0 ||
+    drawn.includes(v);
+
+  const lines = [];
 
   for (
     let i = 0;
-    i < cardsToBuy;
+    i < 5;
     i++
   ) {
-
-    const cardId =
-      randomCardId();
-
-
-    game.taken.add(cardId);
-
-
-    cards.push({
-      cardId,
-      numbers:
-        createCard(),
-      marked:
-        new Set()
-    });
+    lines.push(card[i]);
+    lines.push(
+      card.map((r) => r[i])
+    );
   }
 
+  lines.push(
+    card.map(
+      (r, i) => r[i]
+    )
+  );
 
-  try {
+  lines.push(
+    card.map(
+      (r, i) => r[4 - i]
+    )
+  );
 
-    const result =
-      await pool.query(
+  return lines.some(
+    (l) => l.every(ok)
+  );
+};
+
+let game = null;
+let timer = null;
+
+/* =========================================================
+   WEBSOCKET CLIENTS
+========================================================= */
+
+const clients = new Set();
+
+const send = (
+  ws,
+  object
+) => {
+  if (
+    ws.readyState === 1
+  ) {
+    ws.send(
+      JSON.stringify(object)
+    );
+  }
+};
+
+function pushBalance(
+  uid,
+  balance
+) {
+  clients.forEach(
+    (ws) => {
+      if (
+        String(ws.uid) ===
+        String(uid)
+      ) {
+        send(ws, {
+          type: "balance",
+          balance,
+        });
+      }
+    }
+  );
+}
+
+/* =========================================================
+   GAME RESET
+========================================================= */
+
+function reset() {
+  clearInterval(timer);
+
+  const taken = new Map();
+
+  /*
+   * House/bot cards.
+   * These cards are not real users.
+   */
+  shuffle(
+    Array.from(
+      {
+        length: TOTAL,
+      },
+      (_, i) => i + 1
+    )
+  )
+    .slice(0, BOTS)
+    .forEach(
+      (n) =>
+        taken.set(n, 0)
+    );
+
+  game = {
+    phase: "lobby",
+
+    players:
+      new Map(),
+
+    taken,
+
+    drawn: [],
+
+    pool: shuffle(
+      Array.from(
+        {
+          length: 75,
+        },
+        (_, i) => i + 1
+      )
+    ),
+
+    countdown: null,
+
+    winner: null,
+  };
+
+  broadcast();
+}
+
+const cardCount = () =>
+  [
+    ...game.players.values(),
+  ].reduce(
+    (n, p) =>
+      n + p.cards.length,
+    0
+  );
+
+const prize = () =>
+  Math.floor(
+    cardCount() *
+      CARD_PRICE *
+      (1 - HOUSE_CUT)
+  );
+
+function view(uid) {
+  const p =
+    game.players.get(uid);
+
+  const w =
+    game.winner;
+
+  return {
+    type: "state",
+
+    phase:
+      game.phase,
+
+    countdown:
+      game.countdown,
+
+    players:
+      game.players.size,
+
+    bots:
+      BOTS,
+
+    prize:
+      prize(),
+
+    price:
+      CARD_PRICE,
+
+    max:
+      MAX_CARDS,
+
+    drawn:
+      game.drawn,
+
+    cards:
+      p?.cards ?? [],
+
+    taken:
+      [
+        ...game.taken.keys(),
+      ],
+
+    winner:
+      w
+        ? {
+            names:
+              w.names,
+
+            prize:
+              w.prize,
+
+            you:
+              w.ids.includes(
+                uid
+              ),
+          }
+        : null,
+  };
+}
+
+function broadcast() {
+  clients.forEach(
+    (ws) => {
+      if (ws.uid) {
+        send(
+          ws,
+          view(ws.uid)
+        );
+      }
+    }
+  );
+}
+
+/* =========================================================
+   30 SECOND LOBBY COUNTDOWN
+========================================================= */
+
+function startCountdown() {
+  clearInterval(timer);
+
+  game.countdown =
+    LOBBY_SECS;
+
+  timer = setInterval(
+    () => {
+      game.countdown--;
+
+      if (
+        game.countdown <=
+        0
+      ) {
+        clearInterval(timer);
+
+        if (
+          game.players.size >=
+          MIN_PLAYERS
+        ) {
+          startDraw();
+          return;
+        }
+
+        game.countdown =
+          null;
+
+        if (
+          game.players.size
+        ) {
+          startCountdown();
+        }
+      }
+
+      broadcast();
+    },
+    1000
+  );
+
+  broadcast();
+}
+
+/* =========================================================
+   START DRAW
+========================================================= */
+
+function startDraw() {
+  clearInterval(timer);
+
+  game.phase =
+    "playing";
+
+  game.countdown =
+    null;
+
+  timer = setInterval(
+    async () => {
+      if (
+        !game.pool.length
+      ) {
+        clearInterval(timer);
+
+        game.phase =
+          "ended";
+
+        broadcast();
+
+        setTimeout(
+          reset,
+          3000
+        );
+
+        return;
+      }
+
+      const number =
+        game.pool.pop();
+
+      game.drawn.push(
+        number
+      );
+
+      try {
+        const won =
+          await autoBingo();
+
+        if (won) {
+          return;
+        }
+      } catch (e) {
+        console.error(
+          "Auto bingo error:",
+          e
+        );
+      }
+
+      broadcast();
+    },
+    DRAW_MS
+  );
+
+  broadcast();
+}
+
+/* =========================================================
+   AUTOMATIC BINGO
+========================================================= */
+
+async function autoBingo() {
+  const ids = [];
+  const names = [];
+
+  for (
+    const [
+      uid,
+      p,
+    ] of game.players
+  ) {
+    if (
+      p.cards.some(
+        (c) =>
+          hasLine(
+            c.card,
+            game.drawn
+          )
+      )
+    ) {
+      ids.push(uid);
+      names.push(
+        p.name
+      );
+    }
+  }
+
+  if (!ids.length) {
+    return false;
+  }
+
+  clearInterval(timer);
+
+  const each =
+    Math.floor(
+      prize() /
+        ids.length
+    );
+
+  game.phase =
+    "ended";
+
+  game.winner = {
+    ids,
+    names,
+    prize: each,
+  };
+
+  if (each > 0) {
+    const rows =
+      (
+        await db.query(
+          `
+          UPDATE users
+          SET balance =
+            balance + $1
+          WHERE id =
+            ANY($2::bigint[])
+          RETURNING id, balance
+          `,
+          [
+            each,
+            ids,
+          ]
+        )
+      ).rows;
+
+    rows.forEach(
+      (r) =>
+        pushBalance(
+          r.id,
+          r.balance
+        )
+    );
+  }
+
+  broadcast();
+
+  /*
+   * Winner popup can remain visible
+   * for 3 seconds.
+   */
+  setTimeout(
+    () => {
+      reset();
+
+      /*
+       * Automatically begin the
+       * next 30-second lobby countdown
+       * if there are players.
+       */
+      if (
+        game.players.size >=
+        MIN_PLAYERS
+      ) {
+        startCountdown();
+      }
+    },
+    3000
+  );
+
+  return true;
+}
+
+/* =========================================================
+   JOIN / BUY CARDS
+========================================================= */
+
+async function join(
+  ws,
+  list
+) {
+  const g = game;
+
+  const err = (msg) =>
+    send(ws, {
+      type: "error",
+      msg,
+    });
+
+  if (
+    g.phase !==
+    "lobby"
+  ) {
+    return err(
+      "Round already started. Wait for the next one."
+    );
+  }
+
+  const nos = [
+    ...new Set(
+      (
+        Array.isArray(list)
+          ? list
+          : []
+      ).map(Number)
+    ),
+  ];
+
+  const mine =
+    g.players.get(
+      ws.uid
+    )?.cards.length ??
+    0;
+
+  if (
+    !nos.length ||
+    nos.some(
+      (n) =>
+        !Number.isInteger(n) ||
+        n < 1 ||
+        n > TOTAL
+    )
+  ) {
+    return err(
+      `Pick cards from 1 to ${TOTAL}.`
+    );
+  }
+
+  if (
+    mine + nos.length >
+    MAX_CARDS
+  ) {
+    return err(
+      `You can have up to ${MAX_CARDS} cards.`
+    );
+  }
+
+  if (
+    nos.some((n) =>
+      g.taken.has(n)
+    )
+  ) {
+    return err(
+      "One of those cards is taken. Pick another."
+    );
+  }
+
+  nos.forEach(
+    (n) =>
+      g.taken.set(
+        n,
+        ws.uid
+      )
+  );
+
+  const cost =
+    nos.length *
+    CARD_PRICE;
+
+  const r = (
+    await db.query(
+      `
+      UPDATE users
+      SET balance =
+        balance - $1
+      WHERE id=$2
+      AND balance >= $1
+      RETURNING balance
+      `,
+      [
+        cost,
+        ws.uid,
+      ]
+    )
+  ).rows[0];
+
+  if (!r) {
+    nos.forEach(
+      (n) =>
+        g.taken.delete(n)
+    );
+
+    return err(
+      "Not enough balance. Deposit first."
+    );
+  }
+
+  /*
+   * Protect against a round changing
+   * while payment is being processed.
+   */
+  if (
+    game !== g ||
+    g.phase !==
+      "lobby"
+  ) {
+    const b = (
+      await db.query(
         `
         UPDATE users
-        SET
-          balance = balance - $1,
-          updated_at = NOW()
-        WHERE
-          id = $2
-          AND balance >= $1
+        SET balance =
+          balance + $1
+        WHERE id=$2
         RETURNING balance
         `,
         [
           cost,
-          userId
+          ws.uid,
         ]
-      );
+      )
+    ).rows[0];
 
+    pushBalance(
+      ws.uid,
+      b.balance
+    );
 
-    if (
-      result.rowCount !== 1
-    ) {
+    return err(
+      "Round just started. You were not charged."
+    );
+  }
 
-      for (
-        const card of cards
-      ) {
-
-        game.taken.delete(
-          card.cardId
-        );
-      }
-
-
-      throw new Error(
-        "Insufficient balance"
-      );
-    }
-
-
-    for (
-      const card of cards
-    ) {
-
-      game.cards.set(
-        `${userId}:${card.cardId}`,
-        {
-          userId,
-          cardId:
-            card.cardId,
-          numbers:
-            card.numbers,
-          marked:
-            card.marked,
-          bot: false
-        }
-      );
-    }
-
-
-    startCountdown();
-
-    broadcastGame();
-
-
-    return {
-      cards,
-      cost,
-      balance:
-        Number(
-          result.rows[0].balance
-        )
+  const p =
+    g.players.get(
+      ws.uid
+    ) ?? {
+      name:
+        ws.name,
+      cards: [],
     };
 
-  } catch (err) {
+  nos.forEach(
+    (n) =>
+      p.cards.push({
+        no: n,
+        card:
+          cardFor(n),
+      })
+  );
 
-    for (
-      const card of cards
-    ) {
+  g.players.set(
+    ws.uid,
+    p
+  );
 
-      game.taken.delete(
-        card.cardId
-      );
-    }
+  pushBalance(
+    ws.uid,
+    r.balance
+  );
 
-    throw err;
+  /*
+   * Start 30-second countdown
+   * as soon as enough real players
+   * have joined.
+   */
+  if (
+    g.players.size >=
+      MIN_PLAYERS &&
+    g.countdown === null
+  ) {
+    startCountdown();
   }
+
+  broadcast();
 }
 
+/* =========================================================
+   EXPRESS
+========================================================= */
 
-// ============================================================
-// HEALTH
-// ============================================================
+const app =
+  express();
+
+app.use(
+  express.json()
+);
+
+app.use(
+  express.static("public")
+);
+
+/* =========================================================
+   HEALTH
+========================================================= */
 
 app.get(
   "/health",
   (req, res) => {
-
-    /*
-      Always return HTTP 200.
-
-      Railway can therefore see that the
-      HTTP server is alive even when Telegram
-      polling has a 409 conflict.
-    */
-
     res.status(200).json({
-
       ok: true,
-
-      service: "bingo",
-
-      port: PORT,
-
+      service:
+        "bingo-miniapp",
       database:
-        dbReady
-          ? "ready"
-          : "starting",
-
+        dbReady,
       telegram:
-        botRunning
-          ? "running"
-          : "not-running",
-
-      game:
-        game
-          ? game.status
-          : "starting",
-
-      timestamp:
-        new Date().toISOString()
+        BOT_ENABLED
+          ? "enabled"
+          : "disabled",
+      phase:
+        game?.phase ||
+        "starting",
     });
   }
 );
-
 
 app.get(
   "/api/health",
   (req, res) => {
-
-    res.status(200).json({
-      ok: true,
-      database: dbReady,
-      telegram: botRunning,
-      game: game?.status || null
-    });
-  }
-);
-
-
-// ============================================================
-// BASIC GAME API
-// ============================================================
-
-app.get(
-  "/api/game",
-  (req, res) => {
-
     res.json({
       ok: true,
-      game: publicGameState()
+      database:
+        dbReady,
+      telegram:
+        BOT_ENABLED
+          ? "enabled"
+          : "disabled",
     });
   }
 );
 
+/* =========================================================
+   AUTH MIDDLEWARE
+========================================================= */
 
-// ============================================================
-// USER BALANCE
-// ============================================================
+const auth = (
+  req,
+  res,
+  next
+) => {
+  if (!dbReady) {
+    return res.status(503).json({
+      error:
+        "Database is starting. Please try again.",
+    });
+  }
+
+  const u =
+    verify(
+      req.get(
+        "x-init"
+      )
+    );
+
+  if (!u) {
+    return res.status(401).json({
+      error:
+        "Open this app from Telegram",
+    });
+  }
+
+  req.user = u;
+
+  next();
+};
+
+/* =========================================================
+   ME
+========================================================= */
 
 app.get(
   "/api/me",
-  authMiddleware,
+  auth,
   async (req, res) => {
-
     try {
-
-      const result =
-        await pool.query(
-          `
-          SELECT
-            id,
-            username,
-            first_name,
-            balance,
-            total_deposit
-          FROM users
-          WHERE id = $1
-          `,
-          [
-            req.telegramUser.id
-          ]
-        );
-
-
-      if (!result.rows.length) {
-
-        return res.status(404).json({
-          ok: false,
-          error: "User not found"
-        });
-      }
-
-
       res.json({
-        ok: true,
-        user: result.rows[0]
+        balance:
+          await upsert(
+            req.user
+          ),
+
+        tb: {
+          number:
+            TELEBIRR_NUMBER ||
+            "0982372677",
+
+          name:
+            TELEBIRR_NAME ||
+            "Telebirr account",
+        },
+
+        price:
+          CARD_PRICE,
+
+        minDeposit:
+          MIN_DEPOSIT,
+
+        minWithdraw:
+          MIN_WITHDRAW,
       });
-
-    } catch (err) {
-
-      console.error(
-        "/api/me error:",
-        err.message
-      );
+    } catch (e) {
+      console.error(e);
 
       res.status(500).json({
-        ok: false,
-        error: "Database error"
-      });
-    }
-  }
-);
-
-
-// ============================================================
-// JOIN
-// ============================================================
-
-app.post(
-  "/api/join",
-  authMiddleware,
-  async (req, res) => {
-
-    try {
-
-      const count =
-        Number(
-          req.body?.cards ||
-          req.body?.cardCount ||
-          1
-        );
-
-
-      const result =
-        await joinGame(
-          req.telegramUser.id,
-          count
-        );
-
-
-      res.json({
-        ok: true,
-        ...result
-      });
-
-    } catch (err) {
-
-      res.status(400).json({
-        ok: false,
         error:
-          err.message ||
-          "Could not join"
+          "Server error",
       });
     }
   }
 );
 
-
-// ============================================================
-// MY CARDS
-// ============================================================
-
-app.get(
-  "/api/cards",
-  authMiddleware,
-  (req, res) => {
-
-    const cards = [];
-
-
-    for (
-      const card of game.cards.values()
-    ) {
-
-      if (
-        card.userId ===
-        req.telegramUser.id
-      ) {
-
-        cards.push({
-          cardId:
-            card.cardId,
-
-          numbers:
-            card.numbers,
-
-          marked:
-            [...card.marked]
-        });
-      }
-    }
-
-
-    res.json({
-      ok: true,
-      cards
-    });
-  }
-);
-
-
-// ============================================================
-// DEPOSIT REQUEST
-// ============================================================
+/* =========================================================
+   DEPOSIT
+========================================================= */
 
 app.post(
   "/api/deposit",
-  authMiddleware,
+  auth,
   async (req, res) => {
-
     try {
-
       const amount =
-        Number(
-          req.body?.amount
+        parseInt(
+          req.body.amount
         );
 
-      const reference =
+      const tx =
         String(
-          req.body?.reference ||
-          ""
-        ).trim();
-
+          req.body.txId ||
+            ""
+        )
+          .trim()
+          .toUpperCase();
 
       if (
-        !Number.isFinite(amount) ||
-        amount <= 0
+        !(amount >=
+          MIN_DEPOSIT)
       ) {
-
-        return res.status(400).json({
-          ok: false,
-          error: "Invalid amount"
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              `Minimum deposit is ${MIN_DEPOSIT} birr`,
+          });
       }
 
+      if (
+        !/^[A-Z0-9]{10}$/.test(
+          tx
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              "Transaction ID must be 10 letters/numbers",
+          });
+      }
 
-      const result =
-        await pool.query(
+      await upsert(
+        req.user
+      );
+
+      const id = (
+        await db.query(
           `
-          INSERT INTO deposits
-            (user_id, amount, reference)
-          VALUES
-            ($1, $2, $3)
-          RETURNING id, amount, status
+          INSERT INTO deposits(
+            user_id,
+            amount,
+            tx_id
+          )
+          VALUES($1,$2,$3)
+          RETURNING id
           `,
           [
-            req.telegramUser.id,
+            req.user.id,
             amount,
-            reference || null
+            tx,
           ]
-        );
+        )
+      ).rows[0].id;
 
+      /*
+       * Telegram API works even when
+       * polling is disabled.
+       *
+       * ENABLE_BOT=false only disables
+       * getUpdates polling.
+       */
+      if (
+        bot &&
+        ADMIN_ID
+      ) {
+        const kb =
+          new InlineKeyboard()
+            .text(
+              "✅ Approve",
+              `dep:ok:${id}`
+            )
+            .text(
+              "❌ Reject",
+              `dep:no:${id}`
+            );
+
+        bot.api
+          .sendMessage(
+            ADMIN_ID,
+            `Deposit #${id}\n` +
+              `${req.user.first_name} (${req.user.id})\n` +
+              `Amount: ${amount} birr\n` +
+              `Tx: ${tx}\n` +
+              `${RECEIPT}${tx}`,
+            {
+              reply_markup:
+                kb,
+            }
+          )
+          .catch(
+            (e) =>
+              console.error(
+                "Admin Telegram message failed:",
+                e.message
+              )
+          );
+      }
 
       res.json({
         ok: true,
-        deposit:
-          result.rows[0],
-
-        paymentNumber:
-          TELEBIRR_NUMBER,
-
-        paymentName:
-          TELEBIRR_NAME
       });
+    } catch (e) {
+      if (
+        e.code ===
+        "23505"
+      ) {
+        return res
+          .status(409)
+          .json({
+            error:
+              "This transaction ID was already submitted",
+          });
+      }
 
-    } catch (err) {
-
-      console.error(
-        "Deposit error:",
-        err.message
-      );
+      console.error(e);
 
       res.status(500).json({
-        ok: false,
-        error: "Deposit request failed"
+        error:
+          "Server error",
       });
     }
   }
 );
 
-
-// ============================================================
-// WITHDRAW
-// ============================================================
+/* =========================================================
+   WITHDRAW
+========================================================= */
 
 app.post(
   "/api/withdraw",
-  authMiddleware,
+  auth,
   async (req, res) => {
+    const amount =
+      parseInt(
+        req.body.amount
+      );
 
-    const client =
-      await pool.connect();
-
-
-    try {
-
-      const amount =
-        Number(
-          req.body?.amount
-        );
-
-      const destination =
-        String(
-          req.body?.destination ||
+    const phone =
+      String(
+        req.body.phone ||
           ""
-        ).trim();
+      ).trim();
 
-
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0
-      ) {
-
-        return res.status(400).json({
-          ok: false,
-          error: "Invalid amount"
+    if (
+      !(amount >=
+        MIN_WITHDRAW)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            `Minimum withdrawal is ${MIN_WITHDRAW} birr`,
         });
-      }
-
-
-      if (!destination) {
-
-        return res.status(400).json({
-          ok: false,
-          error: "Destination is required"
-        });
-      }
-
-
-      /*
-        Use a transaction so the balance
-        cannot be deducted without creating
-        the withdrawal.
-      */
-
-      await client.query("BEGIN");
-
-
-      const balanceResult =
-        await client.query(
-          `
-          UPDATE users
-          SET
-            balance = balance - $1,
-            updated_at = NOW()
-          WHERE
-            id = $2
-            AND balance >= $1
-          RETURNING balance
-          `,
-          [
-            amount,
-            req.telegramUser.id
-          ]
-        );
-
-
-      if (
-        balanceResult.rowCount !== 1
-      ) {
-
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(400).json({
-          ok: false,
-          error: "Insufficient balance"
-        });
-      }
-
-
-      const withdrawal =
-        await client.query(
-          `
-          INSERT INTO withdrawals
-            (user_id, amount, destination)
-          VALUES
-            ($1, $2, $3)
-          RETURNING id, amount, destination, status
-          `,
-          [
-            req.telegramUser.id,
-            amount,
-            destination
-          ]
-        );
-
-
-      await client.query(
-        "COMMIT"
-      );
-
-
-      res.json({
-        ok: true,
-
-        withdrawal:
-          withdrawal.rows[0],
-
-        balance:
-          Number(
-            balanceResult.rows[0].balance
-          )
-      });
-
-    } catch (err) {
-
-      try {
-        await client.query(
-          "ROLLBACK"
-        );
-      } catch (_) {}
-
-
-      console.error(
-        "Withdrawal error:",
-        err.message
-      );
-
-
-      res.status(500).json({
-        ok: false,
-        error: "Withdrawal failed"
-      });
-
-    } finally {
-
-      client.release();
     }
-  }
-);
 
-
-// ============================================================
-// PROMO
-// ============================================================
-
-app.post(
-  "/api/promo",
-  authMiddleware,
-  async (req, res) => {
+    if (
+      !/^(09|07|\+2519|\+2517)\d{8}$/.test(
+        phone
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Enter a valid Telebirr phone number",
+        });
+    }
 
     const client =
-      await pool.connect();
-
+      await db.connect();
 
     try {
-
-      const code =
-        String(
-          req.body?.code ||
-          ""
-        )
-        .trim()
-        .toUpperCase();
-
-
-      if (!code) {
-
-        return res.status(400).json({
-          ok: false,
-          error: "Promo code required"
-        });
-      }
-
-
       await client.query(
         "BEGIN"
       );
 
-
-      const promoResult =
+      const b = (
         await client.query(
           `
-          SELECT *
-          FROM promos
-          WHERE code = $1
-          FOR UPDATE
-          `,
-          [code]
-        );
-
-
-      if (
-        promoResult.rowCount !== 1
-      ) {
-
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(404).json({
-          ok: false,
-          error: "Invalid promo code"
-        });
-      }
-
-
-      const promo =
-        promoResult.rows[0];
-
-
-      if (
-        promo.expires_at &&
-        new Date(
-          promo.expires_at
-        ).getTime() <
-        Date.now()
-      ) {
-
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(400).json({
-          ok: false,
-          error: "Promo expired"
-        });
-      }
-
-
-      if (
-        Number(promo.uses) >=
-        Number(promo.max_uses)
-      ) {
-
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(400).json({
-          ok: false,
-          error: "Promo fully used"
-        });
-      }
-
-
-      const already =
-        await client.query(
-          `
-          SELECT 1
-          FROM promo_uses
-          WHERE
-            code = $1
-            AND user_id = $2
+          UPDATE users
+          SET balance =
+            balance - $1
+          WHERE id=$2
+          AND balance >= $1
+          RETURNING balance
           `,
           [
-            code,
-            req.telegramUser.id
+            amount,
+            req.user.id,
           ]
-        );
+        )
+      ).rows[0];
 
-
-      if (
-        already.rowCount
-      ) {
-
+      if (!b) {
         await client.query(
           "ROLLBACK"
         );
 
-        return res.status(400).json({
-          ok: false,
-          error: "Promo already used"
-        });
-      }
-
-
-      if (
-        promo.require_deposit
-      ) {
-
-        const deposit =
-          await client.query(
-            `
-            SELECT 1
-            FROM deposits
-            WHERE
-              user_id = $1
-              AND status = 'approved'
-            LIMIT 1
-            `,
-            [
-              req.telegramUser.id
-            ]
-          );
-
-
-        if (
-          deposit.rowCount === 0
-        ) {
-
-          await client.query(
-            "ROLLBACK"
-          );
-
-          return res.status(400).json({
-            ok: false,
+        return res
+          .status(400)
+          .json({
             error:
-              "Deposit required before using this promo"
+              "Not enough balance",
           });
-        }
       }
 
-
-      await client.query(
-        `
-        UPDATE users
-        SET
-          balance = balance + $1,
-          updated_at = NOW()
-        WHERE id = $2
-        `,
-        [
-          Number(promo.amount),
-          req.telegramUser.id
-        ]
-      );
-
-
-      await client.query(
-        `
-        INSERT INTO promo_uses
-          (code, user_id)
-        VALUES
-          ($1, $2)
-        `,
-        [
-          code,
-          req.telegramUser.id
-        ]
-      );
-
-
-      await client.query(
-        `
-        UPDATE promos
-        SET
-          uses = uses + 1
-        WHERE code = $1
-        `,
-        [code]
-      );
-
+      const id = (
+        await client.query(
+          `
+          INSERT INTO withdrawals(
+            user_id,
+            amount,
+            phone
+          )
+          VALUES($1,$2,$3)
+          RETURNING id
+          `,
+          [
+            req.user.id,
+            amount,
+            phone,
+          ]
+        )
+      ).rows[0].id;
 
       await client.query(
         "COMMIT"
       );
 
+      pushBalance(
+        req.user.id,
+        b.balance
+      );
+
+      if (
+        bot &&
+        ADMIN_ID
+      ) {
+        const kb =
+          new InlineKeyboard()
+            .text(
+              "✅ Mark paid",
+              `wd:paid:${id}`
+            )
+            .text(
+              "❌ Reject",
+              `wd:no:${id}`
+            );
+
+        bot.api
+          .sendMessage(
+            ADMIN_ID,
+            `Withdrawal #${id}\n` +
+              `${req.user.first_name} (${req.user.id})\n` +
+              `Amount: ${amount} birr\n` +
+              `Telebirr: ${phone}`,
+            {
+              reply_markup:
+                kb,
+            }
+          )
+          .catch(
+            (e) =>
+              console.error(
+                "Admin Telegram message failed:",
+                e.message
+              )
+          );
+      }
 
       res.json({
         ok: true,
-        amount:
-          Number(promo.amount)
+        balance:
+          b.balance,
       });
+    } catch (e) {
+      await client
+        .query("ROLLBACK")
+        .catch(() => {});
 
-    } catch (err) {
-
-      try {
-        await client.query(
-          "ROLLBACK"
-        );
-      } catch (_) {}
-
-
-      console.error(
-        "Promo error:",
-        err.message
-      );
-
+      console.error(e);
 
       res.status(500).json({
-        ok: false,
-        error: "Promo failed"
+        error:
+          "Server error",
       });
-
     } finally {
-
       client.release();
     }
   }
 );
 
+/* =========================================================
+   HISTORY
+========================================================= */
 
-// ============================================================
-// ADMIN DEPOSIT APPROVAL
-// ============================================================
-
-app.post(
-  "/api/admin/deposit/:id/approve",
+app.get(
+  "/api/history",
+  auth,
   async (req, res) => {
-
     try {
-
-      const admin =
-        Number(
-          req.headers["x-admin-id"] ||
-          req.body?.adminId ||
-          0
-        );
-
-
-      if (
-        !ADMIN_ID ||
-        admin !== ADMIN_ID
-      ) {
-
-        return res.status(403).json({
-          ok: false,
-          error: "Forbidden"
-        });
-      }
-
-
-      const id =
-        Number(req.params.id);
-
-
-      const client =
-        await pool.connect();
-
-
-      try {
-
-        await client.query(
-          "BEGIN"
-        );
-
-
-        const deposit =
-          await client.query(
-            `
-            SELECT *
-            FROM deposits
-            WHERE id = $1
-            FOR UPDATE
-            `,
-            [id]
-          );
-
-
-        if (
-          deposit.rowCount !== 1
-        ) {
-
-          await client.query(
-            "ROLLBACK"
-          );
-
-          return res.status(404).json({
-            ok: false,
-            error: "Deposit not found"
-          });
-        }
-
-
-        const d =
-          deposit.rows[0];
-
-
-        if (
-          d.status !== "pending"
-        ) {
-
-          await client.query(
-            "ROLLBACK"
-          );
-
-          return res.status(400).json({
-            ok: false,
-            error: "Deposit already processed"
-          });
-        }
-
-
-        await client.query(
+      const r =
+        await db.query(
           `
-          UPDATE deposits
-          SET
-            status = 'approved',
-            approved_at = NOW()
-          WHERE id = $1
-          `,
-          [id]
-        );
+          SELECT
+            'Deposit' AS kind,
+            amount,
+            status,
+            created_at
+          FROM deposits
+          WHERE user_id=$1
 
+          UNION ALL
 
-        await client.query(
-          `
-          UPDATE users
-          SET
-            balance = balance + $1,
-            total_deposit =
-              total_deposit + $1,
-            updated_at = NOW()
-          WHERE id = $2
+          SELECT
+            'Withdrawal',
+            amount,
+            status,
+            created_at
+          FROM withdrawals
+          WHERE user_id=$1
+
+          ORDER BY created_at DESC
+          LIMIT 15
           `,
           [
-            d.amount,
-            d.user_id
+            req.user.id,
           ]
         );
 
-
-        await client.query(
-          "COMMIT"
-        );
-
-
-        res.json({
-          ok: true
-        });
-
-      } catch (err) {
-
-        try {
-          await client.query(
-            "ROLLBACK"
-          );
-        } catch (_) {}
-
-
-        throw err;
-
-      } finally {
-
-        client.release();
-      }
-
-    } catch (err) {
-
-      console.error(
-        "Admin deposit approval error:",
-        err.message
-      );
+      res.json({
+        items:
+          r.rows,
+      });
+    } catch (e) {
+      console.error(e);
 
       res.status(500).json({
-        ok: false,
-        error: "Approval failed"
+        error:
+          "Server error",
       });
     }
   }
 );
 
+/* =========================================================
+   PROMO
+========================================================= */
 
-// ============================================================
-// WEBSOCKET CONNECTION
-// ============================================================
+const tries =
+  new Map();
+
+app.post(
+  "/api/promo",
+  auth,
+  async (req, res) => {
+    const code =
+      String(
+        req.body.code ||
+          ""
+      )
+        .trim()
+        .toUpperCase();
+
+    const recent = (
+      tries.get(
+        req.user.id
+      ) || []
+    ).filter(
+      (t) =>
+        Date.now() - t <
+        60000
+    );
+
+    if (
+      recent.length >=
+      8
+    ) {
+      return res
+        .status(429)
+        .json({
+          error:
+            "Too many tries. Wait a minute.",
+        });
+    }
+
+    tries.set(
+      req.user.id,
+      [
+        ...recent,
+        Date.now(),
+      ]
+    );
+
+    if (
+      !/^[A-Z0-9]{3,20}$/.test(
+        code
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Invalid promo code",
+        });
+    }
+
+    await upsert(
+      req.user
+    );
+
+    const c =
+      await db.connect();
+
+    const fail =
+      (message) => {
+        throw Object.assign(
+          new Error(
+            message
+          ),
+          {
+            user: true,
+          }
+        );
+      };
+
+    try {
+      await c.query(
+        "BEGIN"
+      );
+
+      const p = (
+        await c.query(
+          `
+          SELECT *
+          FROM promos
+          WHERE code=$1
+          FOR UPDATE
+          `,
+          [code]
+        )
+      ).rows[0];
+
+      if (
+        !p ||
+        !p.active ||
+        (
+          p.expires_at &&
+          p.expires_at <
+            new Date()
+        )
+      ) {
+        fail(
+          "Invalid or expired promo code"
+        );
+      }
+
+      if (
+        p.used >=
+        p.max_uses
+      ) {
+        fail(
+          "This promo code has been fully used"
+        );
+      }
+
+      if (
+        REQUIRE_DEPOSIT &&
+        !(
+          await c.query(
+            `
+            SELECT 1
+            FROM deposits
+            WHERE user_id=$1
+            AND status='approved'
+            LIMIT 1
+            `,
+            [
+              req.user.id,
+            ]
+          )
+        ).rowCount
+      ) {
+        fail(
+          "Make your first approved deposit to use promo codes"
+        );
+      }
+
+      const used =
+        await c.query(
+          `
+          INSERT INTO promo_uses(
+            code,
+            user_id
+          )
+          VALUES($1,$2)
+          ON CONFLICT DO NOTHING
+          `,
+          [
+            code,
+            req.user.id,
+          ]
+        );
+
+      if (
+        !used.rowCount
+      ) {
+        fail(
+          "You already used this code"
+        );
+      }
+
+      await c.query(
+        `
+        UPDATE promos
+        SET used=used+1
+        WHERE code=$1
+        `,
+        [code]
+      );
+
+      const b = (
+        await c.query(
+          `
+          UPDATE users
+          SET balance =
+            balance + $1
+          WHERE id=$2
+          RETURNING balance
+          `,
+          [
+            p.amount,
+            req.user.id,
+          ]
+        )
+      ).rows[0];
+
+      await c.query(
+        "COMMIT"
+      );
+
+      pushBalance(
+        req.user.id,
+        b.balance
+      );
+
+      res.json({
+        ok: true,
+        amount:
+          p.amount,
+        balance:
+          b.balance,
+      });
+    } catch (e) {
+      await c
+        .query("ROLLBACK")
+        .catch(() => {});
+
+      if (e.user) {
+        return res
+          .status(400)
+          .json({
+            error:
+              e.message,
+          });
+      }
+
+      console.error(e);
+
+      res.status(500).json({
+        error:
+          "Server error",
+      });
+    } finally {
+      c.release();
+    }
+  }
+);
+
+/* =========================================================
+   HTTP SERVER
+========================================================= */
+
+const server =
+  createServer(app);
+
+/* =========================================================
+   WEBSOCKET
+========================================================= */
+
+const wss =
+  new WebSocketServer({
+    server,
+    path: "/ws",
+  });
 
 wss.on(
   "connection",
   (ws) => {
-
-    ws.isAlive = true;
-
-
-    ws.on(
-      "pong",
-      () => {
-        ws.isAlive = true;
-      }
-    );
-
-
-    /*
-      Immediately send current game.
-    */
-
-    try {
-
-      ws.send(
-        JSON.stringify({
-          type: "game",
-          game: publicGameState()
-        })
-      );
-
-    } catch (err) {
-
-      console.error(
-        "Initial WS send error:",
-        err.message
-      );
-    }
-
-
-    ws.on(
-      "message",
-      async (raw) => {
-
-        try {
-
-          const message =
-            JSON.parse(
-              raw.toString()
-            );
-
-
-          if (
-            message.type ===
-            "ping"
-          ) {
-
-            ws.send(
-              JSON.stringify({
-                type: "pong"
-              })
-            );
-
-            return;
-          }
-
-
-          /*
-            The browser normally uses REST
-            authentication for joining.
-
-            Keep WS available for live game updates.
-          */
-
-        } catch (err) {
-
-          try {
-
-            ws.send(
-              JSON.stringify({
-                type: "error",
-                error: "Invalid message"
-              })
-            );
-
-          } catch (_) {}
-        }
-      }
-    );
-
+    clients.add(ws);
 
     ws.on(
       "close",
       () => {
-        // Nothing required.
+        clients.delete(ws);
       }
     );
-
 
     ws.on(
       "error",
       (err) => {
-
         console.error(
           "WebSocket error:",
           err.message
         );
       }
     );
-  }
-);
 
-
-// ============================================================
-// WEBSOCKET HEARTBEAT
-// ============================================================
-
-const heartbeat =
-  setInterval(
-    () => {
-
-      for (
-        const ws of wss.clients
-      ) {
-
-        if (
-          ws.isAlive === false
-        ) {
-
-          try {
-            ws.terminate();
-          } catch (_) {}
-
-          continue;
-        }
-
-
-        ws.isAlive = false;
-
+    ws.on(
+      "message",
+      async (raw) => {
+        let m;
 
         try {
-          ws.ping();
-        } catch (_) {}
+          m = JSON.parse(
+            raw
+          );
+        } catch {
+          return;
+        }
+
+        /* ---------------- AUTH ---------------- */
+
+        if (
+          m.type ===
+          "auth"
+        ) {
+          const u =
+            verify(
+              m.initData
+            );
+
+          if (!u) {
+            ws.close();
+            return;
+          }
+
+          ws.uid =
+            u.id;
+
+          ws.name =
+            u.first_name ||
+            "Player";
+
+          try {
+            const balance =
+              await upsert(
+                u
+              );
+
+            send(ws, {
+              type:
+                "balance",
+              balance,
+            });
+
+            send(
+              ws,
+              view(u.id)
+            );
+          } catch (e) {
+            console.error(
+              e
+            );
+          }
+
+          return;
+        }
+
+        if (!ws.uid) {
+          return;
+        }
+
+        /* ---------------- JOIN ---------------- */
+
+        try {
+          if (
+            m.type ===
+            "join"
+          ) {
+            await join(
+              ws,
+              m.cards
+            );
+          }
+        } catch (e) {
+          console.error(
+            "WS message error:",
+            e
+          );
+
+          send(ws, {
+            type:
+              "error",
+            msg:
+              "Server error",
+          });
+        }
       }
-
-    },
-    30000
-  );
-
-
-// ============================================================
-// STATIC MINI APP
-// ============================================================
-
-app.use(
-  express.static("public")
-);
-
-
-// ============================================================
-// 404
-// ============================================================
-
-app.use(
-  (req, res) => {
-
-    if (
-      req.path.startsWith("/api/")
-    ) {
-
-      return res.status(404).json({
-        ok: false,
-        error: "Not found"
-      });
-    }
-
-
-    res.status(404).send(
-      "Bingo Mini App server is running."
     );
   }
 );
 
+/* =========================================================
+   STARTUP
+========================================================= */
 
-// ============================================================
-// SERVER STARTUP
-// ============================================================
+async function startTelegramBot() {
+  if (!BOT_ENABLED) {
+    console.log(
+      "🤖 Telegram bot polling DISABLED (ENABLE_BOT=false)"
+    );
 
-let shuttingDown = false;
+    return;
+  }
 
+  if (!bot) {
+    console.error(
+      "❌ ENABLE_BOT=true but BOT_TOKEN is missing"
+    );
 
-async function startServer() {
+    return;
+  }
 
-  /*
-    IMPORTANT:
-
-    Start HTTP server FIRST.
-
-    This lets Railway see the application
-    as alive immediately.
-  */
-
-  await new Promise(
-    (resolve, reject) => {
-
-      const onError = (err) => {
-
-        server.off(
-          "listening",
-          onListening
-        );
-
-        reject(err);
-      };
-
-
-      const onListening = () => {
-
-        server.off(
-          "error",
-          onError
-        );
-
-        resolve();
-      };
-
-
-      server.once(
-        "error",
-        onError
-      );
-
-
-      server.once(
-        "listening",
-        onListening
-      );
-
-
-      server.listen(
-        PORT,
-        "0.0.0.0"
-      );
-    }
-  );
-
-
-  console.log(
-    `🎱 Bingo running on ${PORT}`
-  );
-
-
-  /*
-    Database initialization happens after
-    the HTTP server is listening.
-  */
+  if (botPollingStarted) {
+    return;
+  }
 
   try {
-
-    await initDatabase();
-
-    resetGame();
-
-    /*
-      Start Telegram only after DB is ready.
-    */
-
-    await startTelegramBot();
-
-  } catch (err) {
-
-    console.error(
-      "❌ Startup initialization failed:",
-      err
+    console.log(
+      "🤖 Starting Telegram bot polling..."
     );
 
     /*
-      HTTP remains alive, but database-dependent
-      features will report that the service is
-      still starting.
+     * IMPORTANT:
+     * Only the service with ENABLE_BOT=true
+     * should run Telegram polling.
+     */
+    bot.start({
+      onStart: (info) => {
+        botPollingStarted =
+          true;
 
-      Do NOT blindly process.exit() here.
-    */
+        console.log(
+          `🤖 Telegram bot started: @${info.username}`
+        );
+      },
+    }).catch((err) => {
+      botPollingStarted =
+        false;
+
+      if (
+        err?.error_code ===
+        409
+      ) {
+        console.error(
+          "❌ Telegram 409 Conflict: another bot instance is polling this bot token."
+        );
+
+        console.error(
+          "➡️ Stop the other bot instance or keep ENABLE_BOT=false on this service."
+        );
+
+        /*
+         * DO NOT crash the Bingo server.
+         */
+        return;
+      }
+
+      console.error(
+        "❌ Telegram polling stopped:",
+        err
+      );
+    });
+  } catch (err) {
+    console.error(
+      "❌ Telegram startup error:",
+      err
+    );
   }
 }
 
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
 
-// ============================================================
-// GRACEFUL SHUTDOWN
-// ============================================================
+let shuttingDown =
+  false;
 
 async function shutdown(
   signal
 ) {
-
-  if (shuttingDown) {
+  if (
+    shuttingDown
+  ) {
     return;
   }
 
-  shuttingDown = true;
-
+  shuttingDown =
+    true;
 
   console.log(
-    `🛑 Received ${signal}. Shutting down...`
+    `Received ${signal}. Shutting down...`
   );
-
 
   clearInterval(
-    heartbeat
+    timer
   );
 
-
-  if (game?.timers) {
-
-    clearTimeout(
-      game.timers.countdown
-    );
-
-    clearTimeout(
-      game.timers.calling
-    );
-
-    clearTimeout(
-      game.timers.finish
-    );
-  }
-
-
-  /*
-    Stop Telegram polling.
-  */
-
   try {
-
-    bot.stop();
-
-    console.log(
-      "🤖 Telegram bot stopped"
-    );
-
-  } catch (err) {
-
+    if (
+      bot &&
+      botPollingStarted
+    ) {
+      await bot.stop();
+      botPollingStarted =
+        false;
+    }
+  } catch (e) {
     console.error(
-      "Telegram stop error:",
-      err.message
+      "Bot stop error:",
+      e.message
     );
   }
 
-
-  /*
-    Close WebSocket clients.
-  */
-
-  for (
-    const ws of wss.clients
-  ) {
-
-    try {
-      ws.close();
-    } catch (_) {}
-  }
-
-
   try {
-
     await new Promise(
-      (resolve) => {
-
-        wss.close(
-          () => resolve()
-        );
-      }
-    );
-
-  } catch (_) {}
-
-
-  /*
-    Close HTTP server.
-  */
-
-  try {
-
-    await new Promise(
-      (resolve) => {
-
+      (resolve) =>
         server.close(
-          () => resolve()
-        );
-      }
+          resolve
+        )
     );
-
-  } catch (_) {}
-
-
-  /*
-    Close PostgreSQL.
-  */
-
-  try {
-
-    await pool.end();
-
-    console.log(
-      "📦 PostgreSQL pool closed"
-    );
-
-  } catch (err) {
-
+  } catch (e) {
     console.error(
-      "PostgreSQL shutdown error:",
-      err.message
+      "HTTP close error:",
+      e.message
     );
   }
 
+  try {
+    await db.end();
+  } catch (e) {
+    console.error(
+      "DB close error:",
+      e.message
+    );
+  }
 
-  console.log(
-    "✅ Shutdown complete"
-  );
+  process.exit(0);
 }
-
 
 process.on(
   "SIGTERM",
-  () => {
-    shutdown("SIGTERM");
-  }
+  () =>
+    shutdown(
+      "SIGTERM"
+    )
 );
-
 
 process.on(
   "SIGINT",
-  () => {
-    shutdown("SIGINT");
-  }
+  () =>
+    shutdown(
+      "SIGINT"
+    )
 );
 
+/* =========================================================
+   START SERVER FIRST
+========================================================= */
 
-// ============================================================
-// UNHANDLED ERRORS
-// ============================================================
-
-process.on(
-  "unhandledRejection",
-  (reason) => {
-
-    console.error(
-      "⚠️ Unhandled promise rejection:",
-      reason
+server.listen(
+  Number(PORT),
+  "0.0.0.0",
+  async () => {
+    console.log(
+      `🎯 Bingo running on ${PORT}`
     );
 
-    /*
-      IMPORTANT:
+    console.log(
+      `🤖 Telegram polling: ${
+        BOT_ENABLED
+          ? "ENABLED"
+          : "DISABLED"
+      }`
+    );
 
-      Do NOT process.exit() here.
+    try {
+      await initDatabase();
 
-      This prevents one asynchronous error
-      from killing the Bingo server.
-    */
+      reset();
+
+      await startTelegramBot();
+    } catch (e) {
+      console.error(
+        "❌ Startup error:",
+        e
+      );
+    }
   }
 );
-
-
-process.on(
-  "uncaughtException",
-  (err) => {
-
-    console.error(
-      "⚠️ Uncaught exception:",
-      err
-    );
-
-    /*
-      Keep process alive for recoverable
-      application errors.
-    */
-  }
-);
-
-
-// ============================================================
-// START
-// ============================================================
-
-startServer()
-  .catch((err) => {
-
-    console.error(
-      "❌ Fatal HTTP startup error:",
-      err
-    );
-
-    /*
-      If the HTTP server itself cannot start,
-      there is no point keeping the container.
-    */
-
-    process.exit(1);
-  });
