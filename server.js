@@ -364,7 +364,8 @@ const game = {
   winner: null,
   lobbyTimer: null,
   callTimer: null,
-  endTimer: null
+  endTimer: null,
+  botSetup: false
 };
 
 function drawnPrize() {
@@ -427,21 +428,37 @@ function broadcastWinnerPopup(payload) {
 // GAME LOOP
 // ============================================================
 
-function startLobby() {
+async function startLobby() {
   clearTimers();
   game.phase = "lobby";
   game.countdown = null;
   game.drawn = [];
   game.drawnSet = new Set();
   game.cards.clear();
+  game.pendingCards.clear();
   game.bots = [];
   game.winner = null;
   game.prize = 0;
+
+  // Bots buy their cards DURING the lobby, so their numbers are visible as
+  // taken and humans cannot buy those same numbers.
+  game.botSetup = true;
   sendState();
+  try {
+    await addBots();
+  } catch (err) {
+    console.error("bot lobby setup:", err);
+  } finally {
+    game.botSetup = false;
+  }
+  sendState();
+
+  // Bots are active every round; begin the 30-second lobby automatically.
+  if (game.phase === "lobby" && !game.lobbyTimer) startCountdown();
 }
 
 function startCountdown() {
-  if (game.phase !== "lobby") return;
+  if (game.phase !== "lobby" || game.botSetup || game.lobbyTimer) return;
   game.countdown = LOBBY_COUNTDOWN;
   sendState();
 
@@ -469,6 +486,8 @@ async function addBots() {
       if ([...game.cards.values()].some(entry => entry.cardNo === n) || game.pendingCards.has(n) || botCards.includes(n)) break;
       botCards.push(n);
       game.cards.set(`${botTgId}:${n}`, { cardNo: n, owner: botTgId });
+      // Push the newly taken number immediately so every connected picker marks it unavailable.
+      sendState();
     }
     game.bots.push({ id: i, tgId: botTgId, names: [botName], cards: botCards });
     try {
@@ -486,7 +505,6 @@ async function startRound() {
   game.phase = "playing";
   game.countdown = null;
   sendState();
-  await addBots();
   game.countdown = null;
   sendState();
 
@@ -643,7 +661,7 @@ wss.on("connection", (ws) => {
         try { ws.send(JSON.stringify({ type: "error", msg: `🎁 Welcome! You got ${WELCOME_BONUS} birr free.` })); } catch {}
       }
 
-      if (game.phase === "lobby" && !game.lobbyTimer && game.players.size >= 1) {
+      if (game.phase === "lobby" && !game.botSetup && !game.lobbyTimer && game.players.size >= 1) {
         startCountdown();
       }
       return;
