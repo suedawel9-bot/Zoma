@@ -26,7 +26,7 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
 const CARD_PRICE = Number(process.env.CARD_PRICE || 10);
-const HOUSE_CUT = Number(process.env.HOUSE_CUT || 0);
+const HOUSE_CUT = Number(process.env.HOUSE_CUT ?? 0.10);
 const TOTAL_CARDS = 500;
 const MAX_CARDS_PER_PLAYER = 4;
 const MIN_PLAYERS_TO_START = 2;
@@ -359,6 +359,7 @@ const game = {
   prize: 0,
   players: new Map(),
   cards: new Map(),
+  pendingCards: new Set(),
   bots: [],
   winner: null,
   lobbyTimer: null,
@@ -372,13 +373,11 @@ function drawnPrize() {
 
 function publicState(forTgId) {
   const cardsForUser = [];
-  for (const [cardNo, owner] of game.cards) {
-    if (owner === forTgId) {
-      cardsForUser.push({ no: cardNo, card: cardFor(cardNo) });
-    }
+  for (const entry of game.cards.values()) {
+    if (String(entry.owner) === String(forTgId)) cardsForUser.push({ no: entry.cardNo, card: cardFor(entry.cardNo) });
   }
 
-  const taken = [...game.cards.keys()].sort((a, b) => a - b);
+  const taken = [...new Set([...game.cards.values()].map(entry => entry.cardNo).concat([...game.pendingCards]))];
 
   const winnerPayload = game.winner
     ? {
@@ -457,38 +456,31 @@ function startCountdown() {
   }, 1000);
 }
 
-function addBots() {
+async function addBots() {
   game.bots = [];
-  const usedCards = new Set(game.cards.keys());
-
   for (let i = 0; i < BOT_COUNT; i++) {
-    const botTgId = BOT_ID_BASE + i;
-    const botName = pickBotName(i);
-    const botCards = [];
-
+    const botTgId = BOT_ID_BASE + i, botName = pickBotName(i), botCards = [];
     const nCards = 1 + Math.floor(Math.random() * 2);
     for (let k = 0; k < nCards; k++) {
-      let n;
-      let guard = 0;
-      do {
-        n = 1 + Math.floor(Math.random() * TOTAL_CARDS);
-        guard++;
-      } while (usedCards.has(n) && guard < 5000);
-
-      if (usedCards.has(n)) continue;
-      usedCards.add(n);
+      let n = 0, attempts = 0;
+      do { n = 1 + Math.floor(Math.random() * TOTAL_CARDS); attempts++; }
+      while (([...game.cards.values()].some(entry => entry.cardNo === n) || botCards.includes(n)) && attempts < 2000);
+      if ([...game.cards.values()].some(entry => entry.cardNo === n) || botCards.includes(n)) break;
       botCards.push(n);
-      game.cards.set(n, botTgId);
+      game.cards.set(String(n), { cardNo: n, owner: botTgId });
     }
-
     game.bots.push({ id: i, tgId: botTgId, names: [botName], cards: botCards });
+    try {
+      await pool.query(`UPDATE users SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE telegram_id = $2`,
+        [botCards.length * CARD_PRICE, botTgId]);
+    } catch (err) { console.error("bot card purchase:", err); }
   }
 }
 
 async function startRound() {
   if (game.phase === "playing" || game.phase === "over") return;
 
-  addBots();
+  await addBots();
   game.phase = "playing";
   game.countdown = null;
   sendState();
@@ -519,121 +511,82 @@ function callNext() {
   game.drawn.push(n);
   game.drawnSet.add(n);
 
-  const winner = findWinner();
-  if (winner) return finishRound(winner);
+  const winners = findWinners();
+  if (winners.length) return finishRound(winners);
 
   sendState();
 }
 
-function findWinner() {
-  for (const [cardNo, owner] of game.cards) {
-    const card = cardFor(cardNo);
-    if (hasLine(card, game.drawnSet)) {
-      const ownerNum = typeof owner === "number" ? owner : Number(owner);
-      if (ownerNum >= BOT_ID_BASE) {
-        const idx = ownerNum - BOT_ID_BASE;
-        const bot = game.bots.find((b) => b.id === idx);
-        return { names: bot ? bot.names : [pickBotName(idx)], card: cardNo, tgId: null };
-      } else {
-        const p = game.players.get(ownerNum);
-        return { names: p ? p.names : ["Player"], card: cardNo, tgId: ownerNum };
-      }
-    }
-  }
+function winningPattern(card, drawnSet) {
+  const marked = card.map(row => row.map(n => n === 0 || drawnSet.has(n)));
+  for (let r = 0; r < 5; r++) if (marked[r].every(Boolean)) return `Row ${r + 1}`;
+  for (let c = 0; c < 5; c++) if (marked.every(row => row[c])) return `Column ${c + 1}`;
+  if ([0,1,2,3,4].every(i => marked[i][i])) return "Diagonal ↘";
+  if ([0,1,2,3,4].every(i => marked[i][4-i])) return "Diagonal ↙";
   return null;
 }
 
-async function finishRound(winner) {
-  clearInterval(game.callTimer);
-  game.callTimer = null;
-  game.phase = "over";
+function findWinners() {
+  const found = [];
+  for (const entry of game.cards.values()) {
+    const pattern = winningPattern(cardFor(entry.cardNo), game.drawnSet);
+    if (!pattern) continue;
+    const ownerNum = Number(entry.owner), isBot = ownerNum >= BOT_ID_BASE;
+    const bot = isBot ? game.bots.find(b => b.tgId === ownerNum) : null;
+    const player = game.players.get(ownerNum);
+    found.push({ names: isBot ? (bot ? bot.names : [pickBotName(ownerNum - BOT_ID_BASE)]) :
+      (player ? player.names : ["Player"]), card: entry.cardNo, tgId: ownerNum,
+      owner: entry.owner, pattern, isBot });
+  }
+  const seen = new Set();
+  return found.filter(w => { const k = String(w.owner); if (seen.has(k)) return false; seen.add(k); return true; });
+}
 
-  const prize = drawnPrize();
+async function finishRound(winners) {
+  clearInterval(game.callTimer); game.callTimer = null; game.phase = "over";
+  const allWinners = Array.isArray(winners) ? winners : (winners ? [winners] : []);
+  const poolPrize = drawnPrize();
+  const share = allWinners.length ? Math.floor((poolPrize / allWinners.length) * 100) / 100 : 0;
+  game.winner = allWinners.length ? {
+    names: allWinners.flatMap(w => w.names), card: allWinners[0].card, prize: poolPrize,
+    winners: allWinners.map(w => ({ names: w.names, card: w.card, pattern: w.pattern, prize: share, isBot: w.isBot })),
+    tgId: null
+  } : null;
 
-  if (winner) {
-    game.winner = {
-      names: winner.names,
-      card: winner.card,
-      prize,
-      tgId: winner.tgId
-    };
-
-    if (winner.tgId) {
-      try {
-        const client = await pool.connect();
-        try {
-          await client.query("BEGIN");
-          await client.query(
-            `UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE telegram_id = $2`,
-            [prize, winner.tgId]
-          );
-          await client.query(
-            `INSERT INTO transactions (telegram_id, type, amount, status) VALUES ($1,'win',$2,'completed')`,
-            [winner.tgId, prize]
-          );
-          await client.query("COMMIT");
-        } catch (e) {
-          await client.query("ROLLBACK");
-          throw e;
-        } finally {
-          client.release();
-        }
-
-        for (const ws of wss.clients) {
-          if (ws.tgId === winner.tgId) {
-            try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(winner.tgId) })); } catch {}
-          }
-        }
-      } catch (err) {
-        console.error("payout:", err);
-      }
-    }
-
-    // 🏆 Broadcast winner popup to EVERY connected player
-    broadcastWinnerPopup({
-      names: winner.names,
-      cardNo: winner.card,
-      prize,
-      isBot: !winner.tgId,
-      card: cardFor(winner.card),
-      drawn: game.drawn,
-      duration: WINNER_POPUP_SECONDS * 1000
-    });
-
-    console.log(
-      `🏆 Winner: ${winner.names.join(", ")} | card #${winner.card} | prize ${prize} birr`
-    );
-  } else {
-    game.winner = null;
-
-    broadcastWinnerPopup({
-      names: null,
-      cardNo: null,
-      prize: 0,
-      isBot: false,
-      card: null,
-      drawn: game.drawn,
-      duration: WINNER_POPUP_SECONDS * 1000
-    });
-
-    console.log("🏁 No winner this round");
+  for (const winner of allWinners) if (winner.tgId) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE telegram_id = $2`, [share, winner.tgId]);
+      await client.query(`INSERT INTO transactions (telegram_id, type, amount, status) VALUES ($1,'win',$2,'completed')`, [winner.tgId, share]);
+      await client.query("COMMIT");
+    } catch (e) { await client.query("ROLLBACK"); console.error("payout:", e); }
+    finally { client.release(); }
   }
 
+  broadcastWinnerPopup({
+    winners: allWinners.map(w => ({ names: w.names, cardNo: w.card, prize: share, pattern: w.pattern,
+      isBot: w.isBot, card: cardFor(w.card) })),
+    names: allWinners.flatMap(w => w.names), cardNo: allWinners[0]?.card ?? null, prize: poolPrize,
+    isBot: allWinners.length > 0 && allWinners.every(w => w.isBot),
+    card: allWinners[0] ? cardFor(allWinners[0].card) : null, drawn: game.drawn,
+    duration: WINNER_POPUP_SECONDS * 1000
+  });
+
+  if (!allWinners.length) console.log("🏁 No winner this round");
+  else console.log(`🏆 ${allWinners.length} winner(s), pool ${poolPrize} birr, share ${share} birr each`);
   try {
-    await pool.query(
-      `UPDATE rounds SET phase='over', drawn=$1, winner_names=$2, winner_card=$3, prize=$4, ended_at=NOW()
-       WHERE id = (SELECT id FROM rounds ORDER BY id DESC LIMIT 1)`,
-      [game.drawn, winner ? winner.names : null, winner ? winner.card : null, prize]
-    );
-  } catch (err) {
-    console.error("round update:", err);
-  }
-
+    await pool.query(`UPDATE rounds SET phase='over', drawn=$1, winner_names=$2, winner_card=$3, prize=$4, ended_at=NOW()
+      WHERE id = (SELECT id FROM rounds ORDER BY id DESC LIMIT 1)`,
+      [game.drawn, allWinners.length ? allWinners.flatMap(w => w.names) : null, allWinners[0]?.card ?? null, poolPrize]);
+  } catch (err) { console.error("round update:", err); }
   sendState();
-
-  game.endTimer = setTimeout(() => {
-    startLobby();
-  }, WINNER_POPUP_SECONDS * 1000);
+  for (const winner of allWinners) if (winner.tgId) {
+    const balance = await getBalance(winner.tgId);
+    for (const ws of wss.clients) if (String(ws.tgId) === String(winner.tgId) && ws.readyState === 1)
+      try { ws.send(JSON.stringify({ type: "balance", balance })); } catch {}
+  }
+  game.endTimer = setTimeout(() => startLobby(), WINNER_POPUP_SECONDS * 1000);
 }
 
 function clearTimers() {
@@ -708,15 +661,14 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const owned = [...game.cards.entries()].filter(([, o]) => o === ws.tgId).map(([n]) => n);
+      const owned = [...game.cards.values()].filter(e => String(e.owner) === String(ws.tgId)).map(e => e.cardNo);
+      const taken = new Set([...game.cards.values()].map(e => e.cardNo));
       const room = MAX_CARDS_PER_PLAYER - owned.length;
 
       const valid = [];
       for (const n of requested) {
         if (!Number.isInteger(n) || n < 1 || n > TOTAL_CARDS) continue;
-        if (game.cards.has(n)) continue;
-        if (owned.includes(n)) continue;
-        if (valid.includes(n)) continue;
+        if (owned.includes(n) || valid.includes(n) || taken.has(n) || game.pendingCards.has(n)) continue;
         valid.push(n);
       }
       const take = valid.slice(0, room);
@@ -727,7 +679,16 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const client = await pool.connect();
+      for (const n of take) game.pendingCards.add(n);
+      let client;
+      try {
+        client = await pool.connect();
+      } catch (e) {
+        for (const n of take) game.pendingCards.delete(n);
+        console.error("join connection:", e);
+        try { ws.send(JSON.stringify({ type: "error", msg: "Could not connect to the database" })); } catch {}
+        return;
+      }
       try {
         await client.query("BEGIN");
         const u = await client.query(
@@ -737,6 +698,7 @@ wss.on("connection", (ws) => {
         const bal = Number(u.rows[0]?.balance || 0);
         if (bal < cost) {
           await client.query("ROLLBACK");
+          for (const n of take) game.pendingCards.delete(n);
           try { ws.send(JSON.stringify({ type: "error", msg: `Not enough balance. Need ${cost} birr.` })); } catch {}
           return;
         }
@@ -754,13 +716,17 @@ wss.on("connection", (ws) => {
       } catch (e) {
         await client.query("ROLLBACK");
         console.error("join txn:", e);
+        for (const n of take) game.pendingCards.delete(n);
         try { ws.send(JSON.stringify({ type: "error", msg: "Could not buy cards" })); } catch {}
         return;
       } finally {
         client.release();
       }
 
-      for (const n of take) game.cards.set(n, ws.tgId);
+      for (const n of take) {
+        game.pendingCards.delete(n);
+        game.cards.set(String(n), { cardNo: n, owner: ws.tgId });
+      }
 
       try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
       sendState();
