@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-11 — Bot menu + Invite Friend + Admin buttons
+// Updated: 2026-10-11 — 100 birr deposit gate for withdrawal
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-11");
@@ -45,6 +45,7 @@ const TB_NUMBER = process.env.TB_NUMBER || "0982372677";
 const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
 const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
+const MIN_DEPOSIT_FOR_WITHDRAWAL = Number(process.env.MIN_DEPOSIT_FOR_WITHDRAWAL || 100);
 
 // Referral
 const REFERRAL_BONUS_INVITER = Number(process.env.REFERRAL_BONUS_INVITER || 20);
@@ -128,20 +129,6 @@ async function tgNotify(chatId, text) {
   } catch (e) { console.error("❌ tgNotify error:", e.message); }
 }
 
-async function tgNotifyButtons(chatId, text, keyboard) {
-  if (!ADMIN_BOT_TOKEN || !chatId) return;
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: String(chatId), text, parse_mode: "HTML", disable_web_page_preview: true, reply_markup: keyboard }),
-      signal: AbortSignal.timeout(8000)
-    });
-    const j = await res.json();
-    if (!j.ok) console.error(`❌ tgNotifyButtons failed for ${chatId}:`, j.description);
-  } catch (e) { console.error("❌ tgNotifyButtons error:", e.message); }
-}
-
 // ============================================================
 // ENSURE USER (with referral) + AUTH
 // ============================================================
@@ -157,7 +144,6 @@ async function ensureUser(tgUser, startParam) {
     return { isNew: false, balance: Number(existing.rows[0].balance) };
   }
 
-  // Parse "ref_8240206947"
   let referrerId = null;
   if (startParam && startParam.startsWith("ref_")) {
     const candidate = Number(startParam.slice(4));
@@ -784,7 +770,6 @@ if (ADMIN_BOT_TOKEN) {
     return ctx.reply(`❌ ${r.status}`);
   });
 
-  // ---- Menu handlers ----
   bot.callbackQuery("menu:balance", async (ctx) => {
     try {
       const bal = await getBalance(ctx.from.id);
@@ -795,10 +780,7 @@ if (ADMIN_BOT_TOKEN) {
         `💰 <b>Your Balance</b>\n\nHi ${name}, you have <b>${bal} birr</b>.`,
         { parse_mode: "HTML", reply_markup: menuKeyboard() }
       );
-    } catch (e) {
-      console.error("menu:balance:", e);
-      await ctx.answerCallbackQuery("Error");
-    }
+    } catch (e) { await ctx.answerCallbackQuery("Error"); }
   });
 
   bot.callbackQuery("menu:deposit", async (ctx) => {
@@ -818,6 +800,7 @@ if (ADMIN_BOT_TOKEN) {
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
       `💸 <b>Withdrawal to Telebirr</b>\n\n` +
+      `⚠️ You must have deposited at least <b>${MIN_DEPOSIT_FOR_WITHDRAWAL} birr</b> to withdraw.\n\n` +
       `1. Open the Mini App → Profile → Withdraw\n` +
       `2. Enter amount and your Telebirr phone number\n` +
       `3. Tap Request withdrawal\n\n` +
@@ -881,7 +864,6 @@ if (ADMIN_BOT_TOKEN) {
     );
   });
 
-  // ---- Admin commands ----
   const isAdmin = (ctx) => String(ctx.from.id) === String(ADMIN_TG_ID) || String(ctx.chat.id) === String(ADMIN_TG_ID);
 
   bot.command("pending", async (ctx) => {
@@ -931,7 +913,6 @@ if (ADMIN_BOT_TOKEN) {
     } else await ctx.reply(`Not found.`);
   });
 
-  // ---- Admin inline buttons ----
   bot.callbackQuery(/^approve:(\d+)$/, async (ctx) => {
     if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
     await approveById(Number(ctx.match[1]));
@@ -1090,7 +1071,7 @@ app.get("/api/me", authMiddleware, async (req, res) => {
   try {
     const r = await pool.query(`SELECT telegram_id, username, first_name, last_name, balance FROM users WHERE telegram_id=$1`, [req.tgUser.id]);
     const u = r.rows[0];
-    res.json({ balance: Number(u?.balance || 0), tg: { id: req.tgUser.id, username: req.tgUser.username, first_name: req.tgUser.first_name }, tb: { number: TB_NUMBER, name: TB_NAME }, limits: { min: MIN_DEPOSIT, max: MAX_DEPOSIT } });
+    res.json({ balance: Number(u?.balance || 0), tg: { id: req.tgUser.id, username: req.tgUser.username, first_name: req.tgUser.first_name }, tb: { number: TB_NUMBER, name: TB_NAME }, limits: { min: MIN_DEPOSIT, max: MAX_DEPOSIT, minForWithdraw: MIN_DEPOSIT_FOR_WITHDRAWAL } });
   } catch (err) { console.error(err); res.status(500).json({ error: "Unable to load user" }); }
 });
 
@@ -1172,7 +1153,7 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// WITHDRAW — endpoint
+// WITHDRAW — endpoint with 100 birr deposit gate
 // ============================================================
 
 app.post("/api/withdraw", authMiddleware, async (req, res) => {
@@ -1185,11 +1166,34 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
   let wdId = null;
   try {
     await client.query("BEGIN");
+
+    // === 100 birr deposit gate ===
+    const depSum = await client.query(
+      `SELECT COALESCE(SUM(amount), 0)::numeric AS total
+       FROM transactions
+       WHERE telegram_id=$1 AND type='deposit' AND status='approved'`,
+      [req.tgUser.id]
+    );
+    const totalDeposited = Number(depSum.rows[0].total);
+    if (totalDeposited < MIN_DEPOSIT_FOR_WITHDRAWAL) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `You must deposit at least ${MIN_DEPOSIT_FOR_WITHDRAWAL} birr before you can withdraw. You've deposited ${totalDeposited} birr so far.`
+      });
+    }
+
     const u = await client.query(`SELECT balance FROM users WHERE telegram_id=$1 FOR UPDATE`, [req.tgUser.id]);
     const bal = Number(u.rows[0]?.balance || 0);
-    if (bal < amount) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Insufficient balance" }); }
+    if (bal < amount) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Insufficient balance" });
+    }
+
     await client.query(`UPDATE users SET balance=balance-$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, req.tgUser.id]);
-    const ins = await client.query(`INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3) RETURNING id`, [req.tgUser.id, amount, phone]);
+    const ins = await client.query(
+      `INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3) RETURNING id`,
+      [req.tgUser.id, amount, phone]
+    );
     wdId = ins.rows[0].id;
     await client.query("COMMIT");
   } catch (err) {
@@ -1382,6 +1386,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`💵 CARD_PRICE=${CARD_PRICE}  🏆 HOUSE_CUT=${HOUSE_CUT}`);
   console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}`);
   console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr  |  🎉 REFERRAL_BONUS=${REFERRAL_BONUS_INVITER} birr`);
+  console.log(`💸 Min deposit for withdrawal: ${MIN_DEPOSIT_FOR_WITHDRAWAL} birr`);
   console.log(`💳 Telebirr: ${TB_NUMBER} (${TB_NAME})`);
   console.log(`🤖 Bot username: @${BOT_USERNAME}`);
   console.log(`🔎 Receipt: TB_RECEIVER_NAME="${TB_RECEIVER_NAME}"  AGE=unlimited`);
