@@ -377,7 +377,7 @@ function publicState(forTgId) {
     if (String(entry.owner) === String(forTgId)) cardsForUser.push({ no: entry.cardNo, card: cardFor(entry.cardNo) });
   }
 
-  const taken = [...new Set([...game.cards.values()].map(entry => entry.cardNo).concat([...game.pendingCards]))];
+  const taken = [...new Set([...game.cards.values()].filter(entry => Number(entry.owner) < BOT_ID_BASE).map(entry => entry.cardNo).concat([...game.pendingCards]))];
 
   const winnerPayload = game.winner
     ? {
@@ -464,10 +464,10 @@ async function addBots() {
     for (let k = 0; k < nCards; k++) {
       let n = 0, attempts = 0;
       do { n = 1 + Math.floor(Math.random() * TOTAL_CARDS); attempts++; }
-      while (([...game.cards.values()].some(entry => entry.cardNo === n) || botCards.includes(n)) && attempts < 2000);
-      if ([...game.cards.values()].some(entry => entry.cardNo === n) || botCards.includes(n)) break;
+      while (([...game.cards.values()].some(entry => Number(entry.owner) >= BOT_ID_BASE && entry.cardNo === n) || botCards.includes(n)) && attempts < 2000);
+      if ([...game.cards.values()].some(entry => Number(entry.owner) >= BOT_ID_BASE && entry.cardNo === n) || botCards.includes(n)) break;
       botCards.push(n);
-      game.cards.set(String(n), { cardNo: n, owner: botTgId });
+      game.cards.set(`${botTgId}:${n}`, { cardNo: n, owner: botTgId });
     }
     game.bots.push({ id: i, tgId: botTgId, names: [botName], cards: botCards });
     try {
@@ -662,7 +662,7 @@ wss.on("connection", (ws) => {
       }
 
       const owned = [...game.cards.values()].filter(e => String(e.owner) === String(ws.tgId)).map(e => e.cardNo);
-      const taken = new Set([...game.cards.values()].map(e => e.cardNo));
+      const taken = new Set([...game.cards.values()].filter(e => Number(e.owner) < BOT_ID_BASE).map(e => e.cardNo));
       const room = MAX_CARDS_PER_PLAYER - owned.length;
 
       const valid = [];
@@ -725,7 +725,7 @@ wss.on("connection", (ws) => {
 
       for (const n of take) {
         game.pendingCards.delete(n);
-        game.cards.set(String(n), { cardNo: n, owner: ws.tgId });
+        game.cards.set(`${ws.tgId}:${n}`, { cardNo: n, owner: ws.tgId });
       }
 
       try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
