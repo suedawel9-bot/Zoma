@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-10 — fixed grammy regex command crash
+// Updated: 2026-10-10 — direct Telebirr URL receipt scraper
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-10");
@@ -696,63 +696,123 @@ async function getBalance(tgId) {
 }
 
 // ============================================================
-// DEPOSIT — RECEIPT VERIFY (cheki)
+// DEPOSIT — RECEIPT VERIFY (direct Telebirr URL)
 // ============================================================
 
+/**
+ * Fetches https://transactioninfo.ethiotelecom.et/receipt/<txId>
+ * and parses the fields out of the HTML page.
+ *
+ * NOTE: This may fail with a network error if the Telebirr server
+ * blocks Railway's foreign IP. In that case the deposit falls back
+ * to the SMS-forwarder path (see /webhook/sms).
+ */
 async function verifyTelebirrReceipt(txId) {
+  const url = `https://transactioninfo.ethiotelecom.et/receipt/${encodeURIComponent(txId)}`;
+
   try {
-    const r = await fetch("https://chekiapp.vercel.app/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bank: "telebirr", reference: txId }),
+    const r = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,am;q=0.8",
+        "Cache-Control": "no-cache"
+      },
+      redirect: "follow",
       signal: AbortSignal.timeout(15000)
     });
 
+    console.log(`🔎 telebirr receipt HTTP ${r.status} for ${txId}`);
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
 
-    const j = await r.json();
-    console.log("🔎 cheki response:", JSON.stringify(j).slice(0, 400));
+    const html = await r.text();
+    console.log(`🔎 telebirr html length=${html.length}`);
 
-    const verified =
-      j.verified === true ||
-      j.is_verified === true ||
-      j.success === true ||
-      j.status === "SUCCESS" ||
-      j.status === "success";
+    // Try structured extraction first
+    const parseAmount = (raw) => {
+      if (!raw) return 0;
+      const cleaned = String(raw).replace(/[^\d.]/g, "");
+      const n = Number(cleaned);
+      return Number.isFinite(n) ? n : 0;
+    };
 
-    if (!verified) {
-      return { ok: false, reason: j.error || j.message || "Receipt not verified" };
+    let amount = 0;
+    let receiver = "";
+    let status = "";
+    let found = false;
+
+    // 1) Look for the classic "You have received X birr from NAME"
+    const smsStyle = html.match(/received\s+([\d.,]+)\s*birr\s+from\s+([^<"']+)/i);
+    if (smsStyle) {
+      amount = parseAmount(smsStyle[1]);
+      receiver = smsStyle[2].trim();
+      found = true;
     }
 
-    const amountRaw =
-      j.amount ??
-      j.settled_amount ??
-      j.transaction_amount ??
-      j.data?.amount ??
-      j.data?.settled_amount ??
-      j.receipt?.amount ??
-      0;
+    // 2) Look for standalone amount labels commonly used on Telebirr receipts
+    if (!amount) {
+      const amountMatches = [
+        html.match(/Amount[\s:]*<\/[^>]*>\s*<[^>]*>\s*([\d.,]+)/i),
+        html.match(/Transaction\s*Amount[\s:]*<\/[^>]*>\s*<[^>]*>\s*([\d.,]+)/i),
+        html.match(/Settled\s*Amount[\s:]*<\/[^>]*>\s*<[^>]*>\s*([\d.,]+)/i),
+        html.match(/Total[\s:]*<\/[^>]*>\s*<[^>]*>\s*([\d.,]+)/i),
+        html.match(/ETB\s*([\d.,]+)/i),
+        html.match(/([\d.,]+)\s*ETB/i),
+        html.match(/([\d.,]+)\s*Birr/i)
+      ];
+      for (const m of amountMatches) {
+        if (m) {
+          const candidate = parseAmount(m[1]);
+          if (candidate > 0) { amount = candidate; found = true; break; }
+        }
+      }
+    }
 
-    const receiverRaw =
-      j.receiver_name ??
-      j.receiverName ??
-      j.receiver ??
-      j.data?.receiver_name ??
-      j.receipt?.receiver_name ??
-      "";
+    // 3) Receiver name
+    if (!receiver) {
+      const receiverMatches = [
+        html.match(/Receiver[\s:]*<\/[^>]*>\s*<[^>]*>\s*([^<]+)/i),
+        html.match(/Credited\s*(?:to|Party)[\s:]*<\/[^>]*>\s*<[^>]*>\s*([^<]+)/i),
+        html.match(/To[\s:]*<\/[^>]*>\s*<[^>]*>\s*([^<]+)/i)
+      ];
+      for (const m of receiverMatches) {
+        if (m && m[1].trim()) { receiver = m[1].trim(); break; }
+      }
+    }
 
-    const amount = Number(String(amountRaw).replace(/,/g, ""));
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, reason: "No amount in response" };
+    // 4) Status
+    const statusMatches = [
+      html.match(/Status[\s:]*<\/[^>]*>\s*<[^>]*>\s*([^<]+)/i),
+      html.match(/(Completed|Successful|Success|Failed|Pending)/i)
+    ];
+    for (const m of statusMatches) {
+      if (m && m[1].trim()) { status = m[1].trim(); break; }
+    }
+
+    // 5) If the page contains "not found" or "invalid", treat as failure
+    if (/not\s*found|invalid|no\s*record|does\s*not\s*exist/i.test(html)) {
+      return { ok: false, reason: "Receipt not found on Telebirr" };
+    }
+
+    if (!found || amount <= 0) {
+      return { ok: false, reason: "Could not parse amount from receipt page" };
+    }
+
+    const okStatus = /completed|success|successful/i.test(status) || status === "";
+    if (!okStatus) {
+      return { ok: false, reason: `Status "${status}"` };
     }
 
     return {
       ok: true,
       amount,
-      receiver: String(receiverRaw).trim(),
-      status: "Completed"
+      receiver,
+      status: status || "Completed"
     };
   } catch (e) {
+    // Most common: fetch failed / timeout due to geo-block from Railway IP.
+    console.log(`🔎 telebirr fetch failed: ${e.message}`);
     return { ok: false, reason: e.message };
   }
 }
@@ -919,8 +979,8 @@ if (ADMIN_BOT_TOKEN) {
     const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
     const txId = (args[0] || "").toUpperCase();
 
-    if (!/^DJ[A-Z0-9]{8,}$/.test(txId)) {
-      return ctx.reply("Usage: /check DJ53G7TAZ1");
+    if (!/^DJ[A-Z0-9]{6,}$/.test(txId)) {
+      return ctx.reply("Usage: /check DJ40FCM8GM");
     }
 
     const tgId = ctx.from.id;
@@ -1008,7 +1068,6 @@ if (ADMIN_BOT_TOKEN) {
     await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
   });
 
-  // FIX: grammy doesn't support regex in bot.command — use plain string + parse args
   bot.command("approve", async (ctx) => {
     if (!isAdmin(ctx)) return;
     const id = Number((ctx.match || "").trim());
@@ -1232,8 +1291,8 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
   if (!Number.isFinite(amount) || amount < MIN_DEPOSIT || amount > MAX_DEPOSIT) {
     return res.status(400).json({ error: `Amount must be between ${MIN_DEPOSIT} and ${MAX_DEPOSIT} birr` });
   }
-  if (!txId || !/^DJ[A-Z0-9]{8,}$/.test(txId)) {
-    return res.status(400).json({ error: "Invalid transaction ID (should look like DJ53G7TAZ1)" });
+  if (!txId || !/^DJ[A-Z0-9]{6,}$/.test(txId)) {
+    return res.status(400).json({ error: "Invalid transaction ID (should look like DJ40FCM8GM)" });
   }
 
   const tryClaim = async () => {
@@ -1276,9 +1335,10 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
       throw e;
     }
 
+    // Try the direct Telebirr URL
     const v = await verifyTelebirrReceipt(txId);
     if (v.ok && Number(v.amount) === amount) {
-      const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via cheki" });
+      const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via telebirr receipt" });
       if (r.status === "approved") return res.json({ status: "approved", amount, balance: r.balance });
     }
 
