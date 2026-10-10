@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-11 — 100 birr deposit gate for withdrawal
+// Updated: 2026-10-11 — Four Corners pattern added
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-11");
@@ -47,11 +47,9 @@ const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
 const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
 const MIN_DEPOSIT_FOR_WITHDRAWAL = Number(process.env.MIN_DEPOSIT_FOR_WITHDRAWAL || 100);
 
-// Referral
 const REFERRAL_BONUS_INVITER = Number(process.env.REFERRAL_BONUS_INVITER || 20);
 const BOT_USERNAME = process.env.BOT_USERNAME || "Biinnngobot";
 
-// Receipt verification
 const TB_RECEIVER_NAME = String(process.env.TB_RECEIVER_NAME || "helen yohaness bitew").trim().toLowerCase();
 
 // ============================================================
@@ -438,12 +436,18 @@ function callNext() {
   sendState();
 }
 
+// ============================================================
+// WINNING PATTERN — includes Four Corners
+// ============================================================
+
 function winningPattern(card, drawnSet) {
   const marked = card.map(row => row.map(n => n === 0 || drawnSet.has(n)));
   for (let r = 0; r < 5; r++) if (marked[r].every(Boolean)) return `Row ${r + 1}`;
   for (let c = 0; c < 5; c++) if (marked.every(row => row[c])) return `Column ${c + 1}`;
   if ([0,1,2,3,4].every(i => marked[i][i])) return "Diagonal ↘";
   if ([0,1,2,3,4].every(i => marked[i][4-i])) return "Diagonal ↙";
+  // Four Corners — all 4 outer corners marked
+  if (marked[0][0] && marked[0][4] && marked[4][0] && marked[4][4]) return "Four Corners";
   return null;
 }
 
@@ -1167,7 +1171,6 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // === 100 birr deposit gate ===
     const depSum = await client.query(
       `SELECT COALESCE(SUM(amount), 0)::numeric AS total
        FROM transactions
@@ -1387,6 +1390,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}`);
   console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr  |  🎉 REFERRAL_BONUS=${REFERRAL_BONUS_INVITER} birr`);
   console.log(`💸 Min deposit for withdrawal: ${MIN_DEPOSIT_FOR_WITHDRAWAL} birr`);
+  console.log(`🎯 Patterns: Rows, Columns, Diagonals, Four Corners`);
   console.log(`💳 Telebirr: ${TB_NUMBER} (${TB_NAME})`);
   console.log(`🤖 Bot username: @${BOT_USERNAME}`);
   console.log(`🔎 Receipt: TB_RECEIVER_NAME="${TB_RECEIVER_NAME}"  AGE=unlimited`);
