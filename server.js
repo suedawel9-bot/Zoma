@@ -377,7 +377,8 @@ function publicState(forTgId) {
     if (String(entry.owner) === String(forTgId)) cardsForUser.push({ no: entry.cardNo, card: cardFor(entry.cardNo) });
   }
 
-  const taken = [...new Set([...game.cards.values()].filter(entry => Number(entry.owner) < BOT_ID_BASE).map(entry => entry.cardNo).concat([...game.pendingCards]))];
+  // Every card number is globally unique for the round, including bot-owned cards.
+  const taken = [...new Set([...game.cards.values()].map(entry => entry.cardNo).concat([...game.pendingCards]))];
 
   const winnerPayload = game.winner
     ? {
@@ -464,8 +465,8 @@ async function addBots() {
     for (let k = 0; k < nCards; k++) {
       let n = 0, attempts = 0;
       do { n = 1 + Math.floor(Math.random() * TOTAL_CARDS); attempts++; }
-      while (([...game.cards.values()].some(entry => Number(entry.owner) >= BOT_ID_BASE && entry.cardNo === n) || botCards.includes(n)) && attempts < 2000);
-      if ([...game.cards.values()].some(entry => Number(entry.owner) >= BOT_ID_BASE && entry.cardNo === n) || botCards.includes(n)) break;
+      while (([...game.cards.values()].some(entry => entry.cardNo === n) || game.pendingCards.has(n) || botCards.includes(n)) && attempts < 2000);
+      if ([...game.cards.values()].some(entry => entry.cardNo === n) || game.pendingCards.has(n) || botCards.includes(n)) break;
       botCards.push(n);
       game.cards.set(`${botTgId}:${n}`, { cardNo: n, owner: botTgId });
     }
@@ -662,7 +663,8 @@ wss.on("connection", (ws) => {
       }
 
       const owned = [...game.cards.values()].filter(e => String(e.owner) === String(ws.tgId)).map(e => e.cardNo);
-      const taken = new Set([...game.cards.values()].filter(e => Number(e.owner) < BOT_ID_BASE).map(e => e.cardNo));
+      // Humans cannot buy a card already owned by any human OR bot.
+      const taken = new Set([...game.cards.values()].map(e => e.cardNo));
       const room = MAX_CARDS_PER_PLAYER - owned.length;
 
       const valid = [];
