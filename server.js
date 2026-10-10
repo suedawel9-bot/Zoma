@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-10 — cheki receipt verification (works from Railway)
+// Updated: 2026-10-10 — fixed grammy regex command crash
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-10");
@@ -696,19 +696,15 @@ async function getBalance(tgId) {
 }
 
 // ============================================================
-// DEPOSIT — RECEIPT VERIFY (cheki API)
+// DEPOSIT — RECEIPT VERIFY (cheki)
 // ============================================================
 
 async function verifyTelebirrReceipt(txId) {
   try {
-    // Public cheki API — Ethiopian servers handle the geo-restricted receipt page.
     const r = await fetch("https://chekiapp.vercel.app/verify", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        bank: "telebirr",
-        reference: txId
-      }),
+      body: JSON.stringify({ bank: "telebirr", reference: txId }),
       signal: AbortSignal.timeout(15000)
     });
 
@@ -717,7 +713,6 @@ async function verifyTelebirrReceipt(txId) {
     const j = await r.json();
     console.log("🔎 cheki response:", JSON.stringify(j).slice(0, 400));
 
-    // Accept any of the common "verified" flags cheki has used over time.
     const verified =
       j.verified === true ||
       j.is_verified === true ||
@@ -729,7 +724,6 @@ async function verifyTelebirrReceipt(txId) {
       return { ok: false, reason: j.error || j.message || "Receipt not verified" };
     }
 
-    // Amount may live under any of these keys depending on cheki's payload shape.
     const amountRaw =
       j.amount ??
       j.settled_amount ??
@@ -1014,15 +1008,19 @@ if (ADMIN_BOT_TOKEN) {
     await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
   });
 
-  bot.command(/^approve_(\d+)$/, async (ctx) => {
+  // FIX: grammy doesn't support regex in bot.command — use plain string + parse args
+  bot.command("approve", async (ctx) => {
     if (!isAdmin(ctx)) return;
-    await approveById(Number(ctx.match[1]));
-    await ctx.reply(`✅ Approved #${ctx.match[1]}`);
+    const id = Number((ctx.match || "").trim());
+    if (!Number.isInteger(id) || id <= 0) return ctx.reply("Usage: /approve <id>");
+    await approveById(id);
+    await ctx.reply(`✅ Approved #${id}`);
   });
 
-  bot.command(/^reject_(\d+)$/, async (ctx) => {
+  bot.command("reject", async (ctx) => {
     if (!isAdmin(ctx)) return;
-    const id = Number(ctx.match[1]);
+    const id = Number((ctx.match || "").trim());
+    if (!Number.isInteger(id) || id <= 0) return ctx.reply("Usage: /reject <id>");
     await pool.query(
       `UPDATE transactions SET status='rejected', note='Rejected via bot' WHERE id=$1 AND status='pending'`,
       [id]
