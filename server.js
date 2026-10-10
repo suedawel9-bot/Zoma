@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-10 — Telegram bot + strict tx matching
+// Updated: 2026-10-10 — cheki receipt verification (works from Railway)
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-10");
@@ -49,7 +49,6 @@ const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 
 const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
 const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
-const RECEIPT_MAX_AGE_HOURS = Number(process.env.RECEIPT_MAX_AGE_HOURS || 24);
 
 // ============================================================
 // BOT NAMES
@@ -154,7 +153,7 @@ async function tgNotify(chatId, text) {
 }
 
 // ============================================================
-// ENSURE USER + AUTH MIDDLEWARE
+// ENSURE USER + AUTH
 // ============================================================
 
 async function ensureUser(tgUser) {
@@ -186,7 +185,7 @@ async function ensureUser(tgUser) {
     );
   }
 
-  console.log(`🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id} (${tgUser.first_name || tgUser.username || "new"})`);
+  console.log(`🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id}`);
   return { isNew: true, balance: Number(inserted.rows[0].balance) };
 }
 
@@ -213,10 +212,6 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, "public")));
-
-// ============================================================
-// HEALTH CHECK — instant, no DB, must be first
-// ============================================================
 
 let startupReady = false;
 
@@ -345,7 +340,7 @@ async function initDatabase() {
 }
 
 // ============================================================
-// BOT SEEDING — bulk insert
+// BOT SEEDING
 // ============================================================
 
 const BOT_ID_BASE = 9000000000000;
@@ -701,43 +696,75 @@ async function getBalance(tgId) {
 }
 
 // ============================================================
-// DEPOSIT — RECEIPT VERIFY
+// DEPOSIT — RECEIPT VERIFY (cheki API)
 // ============================================================
 
 async function verifyTelebirrReceipt(txId) {
   try {
-    const url = `https://transactioninfo.ethiotelecom.et/api/receipt/${encodeURIComponent(txId)}`;
-    const r = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; ZomaBingo/1.0)",
-        "Accept": "application/json",
-        "Referer": "https://transactioninfo.ethiotelecom.et/"
-      },
-      signal: AbortSignal.timeout(8000)
+    // Public cheki API — Ethiopian servers handle the geo-restricted receipt page.
+    const r = await fetch("https://chekiapp.vercel.app/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        bank: "telebirr",
+        reference: txId
+      }),
+      signal: AbortSignal.timeout(15000)
     });
+
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
-    const d = await r.json();
-    const amount = Number(d.amount ?? d.transactionAmount ?? 0);
-    const receiver = String(d.receiverName ?? d.receiver ?? "").trim();
-    const status = String(d.status ?? d.transactionStatus ?? "").toLowerCase();
-    const dateStr = d.date ?? d.transactionDate ?? null;
-    if (!amount) return { ok: false, reason: "No amount" };
-    if (!["completed","success","successful"].includes(status)) return { ok: false, reason: `Status "${status}"` };
-    if (dateStr) {
-      const ts = Date.parse(dateStr);
-      if (!Number.isNaN(ts)) {
-        const ageH = (Date.now() - ts) / 36e5;
-        if (ageH > RECEIPT_MAX_AGE_HOURS) return { ok: false, reason: "Too old" };
-      }
+
+    const j = await r.json();
+    console.log("🔎 cheki response:", JSON.stringify(j).slice(0, 400));
+
+    // Accept any of the common "verified" flags cheki has used over time.
+    const verified =
+      j.verified === true ||
+      j.is_verified === true ||
+      j.success === true ||
+      j.status === "SUCCESS" ||
+      j.status === "success";
+
+    if (!verified) {
+      return { ok: false, reason: j.error || j.message || "Receipt not verified" };
     }
-    return { ok: true, amount, receiver, status, date: dateStr };
+
+    // Amount may live under any of these keys depending on cheki's payload shape.
+    const amountRaw =
+      j.amount ??
+      j.settled_amount ??
+      j.transaction_amount ??
+      j.data?.amount ??
+      j.data?.settled_amount ??
+      j.receipt?.amount ??
+      0;
+
+    const receiverRaw =
+      j.receiver_name ??
+      j.receiverName ??
+      j.receiver ??
+      j.data?.receiver_name ??
+      j.receipt?.receiver_name ??
+      "";
+
+    const amount = Number(String(amountRaw).replace(/,/g, ""));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return { ok: false, reason: "No amount in response" };
+    }
+
+    return {
+      ok: true,
+      amount,
+      receiver: String(receiverRaw).trim(),
+      status: "Completed"
+    };
   } catch (e) {
     return { ok: false, reason: e.message };
   }
 }
 
 // ============================================================
-// DEPOSIT — NOTIFY + CREDIT + CLAIM (strict tx_id matching)
+// DEPOSIT — NOTIFY / CREDIT / CLAIM
 // ============================================================
 
 async function notifyCredited(telegramId, amount, txId, source) {
@@ -859,7 +886,7 @@ async function claimOrphan({ txId, userId, amount }) {
 }
 
 // ============================================================
-// TELEGRAM BOT (grammy)
+// TELEGRAM BOT
 // ============================================================
 
 let bot = null;
@@ -889,7 +916,7 @@ if (ADMIN_BOT_TOKEN) {
     try {
       const bal = await getBalance(ctx.from.id);
       await ctx.reply(`💰 Balance: <b>${bal} birr</b>`, { parse_mode: "HTML" });
-    } catch (e) {
+    } catch {
       await ctx.reply("Could not load balance.");
     }
   });
@@ -964,7 +991,6 @@ if (ADMIN_BOT_TOKEN) {
     return ctx.reply(`❌ ${r.status}`);
   });
 
-  // ---- Admin commands ----
   const isAdmin = (ctx) =>
     String(ctx.from.id) === String(ADMIN_TG_ID) ||
     String(ctx.chat.id) === String(ADMIN_TG_ID);
@@ -1023,7 +1049,6 @@ if (ADMIN_BOT_TOKEN) {
   });
 
   bot.catch((err) => console.error("bot error:", err));
-
   console.log(`🤖 Telegram bot initialized (polling)`);
 } else {
   console.warn("⚠️ ADMIN_BOT_TOKEN not set — Telegram bot disabled");
@@ -1255,7 +1280,7 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 
     const v = await verifyTelebirrReceipt(txId);
     if (v.ok && Number(v.amount) === amount) {
-      const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via receipt" });
+      const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via cheki" });
       if (r.status === "approved") return res.json({ status: "approved", amount, balance: r.balance });
     }
 
@@ -1554,7 +1579,6 @@ server.listen(PORT, "0.0.0.0", async () => {
     await seedBots();
     startupReady = true;
 
-    // Start Telegram bot AFTER DB is ready
     if (bot) {
       try {
         bot.start({
