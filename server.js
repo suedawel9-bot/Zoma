@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-11 — Telegram admin notifications with action buttons
+// Updated: 2026-10-11 — Bot menu + Invite Friend + Admin buttons
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-11");
@@ -46,7 +46,11 @@ const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
 const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
 
-// Full receiver name for stricter anti-fraud
+// Referral
+const REFERRAL_BONUS_INVITER = Number(process.env.REFERRAL_BONUS_INVITER || 20);
+const BOT_USERNAME = process.env.BOT_USERNAME || "Biinnngobot";
+
+// Receipt verification
 const TB_RECEIVER_NAME = String(process.env.TB_RECEIVER_NAME || "helen yohaness bitew").trim().toLowerCase();
 
 // ============================================================
@@ -96,7 +100,9 @@ function validateInitData(initData) {
     if (!crypto.timingSafeEqual(a, b)) return null;
     const userRaw = params.get("user");
     if (!userRaw) return null;
-    return JSON.parse(userRaw);
+    const user = JSON.parse(userRaw);
+    user.start_param = params.get("start_param") || null;
+    return user;
   } catch { return null; }
 }
 
@@ -122,20 +128,13 @@ async function tgNotify(chatId, text) {
   } catch (e) { console.error("❌ tgNotify error:", e.message); }
 }
 
-// Send a message with inline buttons
 async function tgNotifyButtons(chatId, text, keyboard) {
   if (!ADMIN_BOT_TOKEN || !chatId) return;
   try {
     const res = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: String(chatId),
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_markup: keyboard
-      }),
+      body: JSON.stringify({ chat_id: String(chatId), text, parse_mode: "HTML", disable_web_page_preview: true, reply_markup: keyboard }),
       signal: AbortSignal.timeout(8000)
     });
     const j = await res.json();
@@ -144,23 +143,69 @@ async function tgNotifyButtons(chatId, text, keyboard) {
 }
 
 // ============================================================
-// ENSURE USER + AUTH
+// ENSURE USER (with referral) + AUTH
 // ============================================================
 
-async function ensureUser(tgUser) {
+async function ensureUser(tgUser, startParam) {
   const existing = await pool.query(`SELECT telegram_id, balance FROM users WHERE telegram_id = $1`, [tgUser.id]);
+
   if (existing.rows.length) {
-    await pool.query(`UPDATE users SET username=$1, first_name=$2, last_name=$3, updated_at=NOW() WHERE telegram_id=$4`,
-      [tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, tgUser.id]);
+    await pool.query(
+      `UPDATE users SET username=$1, first_name=$2, last_name=$3, updated_at=NOW() WHERE telegram_id=$4`,
+      [tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, tgUser.id]
+    );
     return { isNew: false, balance: Number(existing.rows[0].balance) };
   }
-  const inserted = await pool.query(
-    `INSERT INTO users (telegram_id, username, first_name, last_name, balance) VALUES ($1,$2,$3,$4,$5) RETURNING balance`,
-    [tgUser.id, tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, WELCOME_BONUS]);
-  if (WELCOME_BONUS > 0) {
-    await pool.query(`INSERT INTO transactions (telegram_id, type, amount, status) VALUES ($1,'welcome_bonus',$2,'completed')`, [tgUser.id, WELCOME_BONUS]);
+
+  // Parse "ref_8240206947"
+  let referrerId = null;
+  if (startParam && startParam.startsWith("ref_")) {
+    const candidate = Number(startParam.slice(4));
+    if (Number.isInteger(candidate) && candidate > 0 && candidate !== tgUser.id) {
+      const r = await pool.query(`SELECT telegram_id FROM users WHERE telegram_id=$1`, [candidate]);
+      if (r.rows.length) referrerId = candidate;
+    }
   }
-  console.log(`🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id}`);
+
+  const inserted = await pool.query(
+    `INSERT INTO users (telegram_id, username, first_name, last_name, balance, referred_by)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING balance`,
+    [tgUser.id, tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, WELCOME_BONUS, referrerId]
+  );
+
+  if (WELCOME_BONUS > 0) {
+    await pool.query(
+      `INSERT INTO transactions (telegram_id, type, amount, status, note)
+       VALUES ($1, 'welcome_bonus', $2, 'completed', 'Welcome bonus')`,
+      [tgUser.id, WELCOME_BONUS]
+    );
+  }
+
+  if (referrerId && REFERRAL_BONUS_INVITER > 0) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [REFERRAL_BONUS_INVITER, referrerId]);
+      await client.query(
+        `INSERT INTO transactions (telegram_id, type, amount, status, note)
+         VALUES ($1, 'referral', $2, 'completed', $3)`,
+        [referrerId, REFERRAL_BONUS_INVITER, `Friend joined: ${tgUser.first_name || tgUser.id}`]
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("referral credit:", e);
+    } finally { client.release(); }
+
+    await tgNotify(referrerId,
+      `🎉 <b>Your friend joined!</b>\n\n` +
+      `You earned <b>+${REFERRAL_BONUS_INVITER} birr</b> for inviting ` +
+      `${tgUser.first_name || "a new player"}.\n\n` +
+      `Keep inviting for more bonuses!`
+    );
+  }
+
+  console.log(`🎁 New user ${tgUser.id}${referrerId ? ` (referred by ${referrerId})` : ""}`);
   return { isNew: true, balance: Number(inserted.rows[0].balance) };
 }
 
@@ -169,7 +214,7 @@ async function authMiddleware(req, res, next) {
     const tgUser = validateInitData(extractInitData(req));
     if (!tgUser) return res.status(401).json({ error: "Invalid Telegram Mini App authentication" });
     req.tgUser = tgUser;
-    const { isNew } = await ensureUser(tgUser);
+    const { isNew } = await ensureUser(tgUser, tgUser.start_param);
     req.isNewUser = isNew;
     next();
   } catch (err) {
@@ -192,8 +237,7 @@ let startupReady = false;
 
 app.get("/health", (req, res) => {
   res.status(200).json({
-    ok: true,
-    ready: startupReady,
+    ok: true, ready: startupReady,
     uptime: Math.floor(process.uptime()),
     game: game?.phase || "starting",
     bots: BOT_COUNT
@@ -211,9 +255,8 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 // ============================================================
 
 if (!DATABASE_URL) console.error("❌ DATABASE_URL missing");
-if (!BOT_TOKEN) console.error("❌ BOT_TOKEN missing — auth will fail");
-if (!ADMIN_TG_ID) console.warn("⚠️ ADMIN_TG_ID missing — admin notifications disabled");
-if (!TB_RECEIVER_NAME) console.warn("⚠️ TB_RECEIVER_NAME missing — receipt verification will not auto-credit");
+if (!BOT_TOKEN) console.error("❌ BOT_TOKEN missing");
+if (!ADMIN_TG_ID) console.warn("⚠️ ADMIN_TG_ID missing");
 
 const pool = new Pool({
   connectionString: DATABASE_URL || undefined,
@@ -227,13 +270,17 @@ pool.on("error", (err) => console.error("pg pool:", err));
 async function initDatabase() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE NOT NULL, username TEXT, first_name TEXT, last_name TEXT, balance NUMERIC(18,2) NOT NULL DEFAULT 0, is_bot BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT;`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, type TEXT NOT NULL, amount NUMERIC(18,2) NOT NULL, status TEXT NOT NULL DEFAULT 'pending', tx_id TEXT, phone TEXT, note TEXT, auto BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`);
   await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT;`);
   await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS auto BOOLEAN NOT NULL DEFAULT FALSE;`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS transactions_tx_id_unique ON transactions (tx_id) WHERE tx_id IS NOT NULL;`);
+
   await pool.query(`CREATE TABLE IF NOT EXISTS promo_codes (code TEXT PRIMARY KEY, amount NUMERIC(18,2) NOT NULL, max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`);
   await pool.query(`CREATE TABLE IF NOT EXISTS promo_redemptions (id SERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(telegram_id, code));`);
   await pool.query(`CREATE TABLE IF NOT EXISTS rounds (id SERIAL PRIMARY KEY, round_number INTEGER NOT NULL, phase TEXT NOT NULL, drawn INTEGER[] NOT NULL DEFAULT '{}', winner_names TEXT[], winner_card INTEGER, prize NUMERIC(18,2) NOT NULL DEFAULT 0, started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), ended_at TIMESTAMPTZ);`);
+
   const pc = await pool.query(`SELECT COUNT(*)::int AS n FROM promo_codes`);
   if (pc.rows[0].n === 0) {
     await pool.query(`INSERT INTO promo_codes (code, amount, max_uses) VALUES ('WELCOME20',20,1000),('ZOMA50',50,500),('BINGO100',100,200) ON CONFLICT (code) DO NOTHING;`);
@@ -481,7 +528,7 @@ async function getBalance(tgId) {
 }
 
 // ============================================================
-// HARDENED RECEIPT VERIFICATION (no age limit)
+// RECEIPT VERIFY
 // ============================================================
 
 function htmlToLines(html) {
@@ -493,9 +540,7 @@ function htmlToLines(html) {
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
-    .split("\n")
-    .map((s) => s.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
+    .split("\n").map(s => s.replace(/\s+/g, " ").trim()).filter(Boolean);
 }
 
 function fieldAfter(lines, labelRe) {
@@ -510,10 +555,9 @@ function fieldAfter(lines, labelRe) {
 
 async function verifyTelebirrReceipt(txId) {
   if (!/^DJ[A-Z0-9]{6,}$/.test(txId)) return { ok: false, reason: "Bad tx id" };
-  if (!TB_RECEIVER_NAME) return { ok: false, reason: "TB_RECEIVER_NAME not set (manual approval)" };
+  if (!TB_RECEIVER_NAME) return { ok: false, reason: "TB_RECEIVER_NAME not set" };
 
   const url = `https://transactioninfo.ethiotelecom.et/receipt/${encodeURIComponent(txId)}`;
-
   try {
     const r = await fetch(url, {
       method: "GET",
@@ -525,7 +569,6 @@ async function verifyTelebirrReceipt(txId) {
       redirect: "follow",
       signal: AbortSignal.timeout(15000)
     });
-
     console.log(`🔎 telebirr receipt HTTP ${r.status} for ${txId}`);
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
 
@@ -538,13 +581,10 @@ async function verifyTelebirrReceipt(txId) {
 
     const lines = htmlToLines(html);
     const text = lines.join(" ");
-
     if (!text.toUpperCase().includes(txId)) return { ok: false, reason: "Tx id not found on page" };
 
     const status = fieldAfter(lines, /^(?:transaction\s*status|status)\s*[:\-]?\s*(.*)$/i);
-    if (!/^(completed|success|successful)$/i.test(status)) {
-      return { ok: false, reason: `Status "${status || "missing"}"` };
-    }
+    if (!/^(completed|success|successful)$/i.test(status)) return { ok: false, reason: `Status "${status || "missing"}"` };
 
     const amountRaw =
       fieldAfter(lines, /^(?:settled\s*amount)\s*[:\-]?\s*(.*)$/i) ||
@@ -552,23 +592,14 @@ async function verifyTelebirrReceipt(txId) {
       fieldAfter(lines, /^(?:amount)\s*[:\-]?\s*(.*)$/i);
     const am = amountRaw.match(/([\d,]+(?:\.\d+)?)/);
     const amount = am ? Number(am[1].replace(/,/g, "")) : 0;
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return { ok: false, reason: "Could not read amount" };
-    }
+    if (!Number.isFinite(amount) || amount <= 0) return { ok: false, reason: "Could not read amount" };
 
-    const receiver = fieldAfter(
-      lines,
-      /^(?:credited\s*party\s*name|receiver(?:\s*name)?)\s*[:\-]?\s*(.*)$/i
-    );
-    if (!receiver || !receiver.toLowerCase().includes(TB_RECEIVER_NAME)) {
-      return { ok: false, reason: `Receiver mismatch (${receiver.slice(0, 40) || "missing"})` };
-    }
+    const receiver = fieldAfter(lines, /^(?:credited\s*party\s*name|receiver(?:\s*name)?)\s*[:\-]?\s*(.*)$/i);
+    if (!receiver || !receiver.toLowerCase().includes(TB_RECEIVER_NAME)) return { ok: false, reason: `Receiver mismatch` };
 
     const digitsOnly = lines.join(" ").replace(/\D/g, "");
     const myDigits = TB_NUMBER.replace(/\D/g, "");
-    if (myDigits.length >= 8 && !digitsOnly.includes(myDigits)) {
-      return { ok: false, reason: "Receiver account number not on page" };
-    }
+    if (myDigits.length >= 8 && !digitsOnly.includes(myDigits)) return { ok: false, reason: "Receiver account number not on page" };
 
     return { ok: true, amount, receiver, status: "Completed" };
   } catch (e) {
@@ -578,7 +609,7 @@ async function verifyTelebirrReceipt(txId) {
 }
 
 // ============================================================
-// DEPOSIT — NOTIFY / CREDIT / CLAIM
+// DEPOSIT — CREDIT / CLAIM
 // ============================================================
 
 async function notifyCredited(telegramId, amount, txId, source) {
@@ -610,12 +641,12 @@ async function creditDeposit({ txId, amount, source = "auto", note = null }) {
       return { status: "orphan" };
     }
     dep = r.rows[0];
-    if (dep.status === "approved") { await client.query("ROLLBACK"); return { status: "duplicate", message: "Already approved" }; }
+    if (dep.status === "approved") { await client.query("ROLLBACK"); return { status: "duplicate" }; }
     if (dep.type !== "deposit" || dep.status !== "pending") { await client.query("ROLLBACK"); return { status: "orphan" }; }
     if (Number(dep.amount) !== Number(amount)) {
       await client.query(`UPDATE transactions SET note=$1 WHERE id=$2`, [`Amount mismatch: claimed ${dep.amount}, receipt ${amount}`, dep.id]);
       await client.query("COMMIT");
-      if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID, `⚠️ <b>Amount mismatch</b>\nUser: ${dep.telegram_id}\nClaimed: ${dep.amount}\nReceipt: ${amount}\nTxID: ${txId}`);
+      if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID, `⚠️ <b>Amount mismatch</b>\nUser: ${dep.telegram_id}\nClaimed: ${dep.amount}\nReceipt: ${amount}`);
       return { status: "mismatch" };
     }
     await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, dep.telegram_id]);
@@ -658,15 +689,72 @@ let bot = null;
 if (ADMIN_BOT_TOKEN) {
   bot = new Bot(ADMIN_BOT_TOKEN);
 
+  function menuKeyboard() {
+    return new InlineKeyboard()
+      .text("💰 My Balance", "menu:balance")
+      .text("💳 Deposit", "menu:deposit").row()
+      .text("💸 Withdrawal", "menu:withdraw")
+      .text("🎱 Play Bingo", "menu:play").row()
+      .text("👥 Invite Friend", "menu:invite")
+      .text("📖 Help", "menu:help");
+  }
+
   bot.command("start", async (ctx) => {
-    await ctx.reply(`🎱 <b>Zoma Bingo Bot</b>\n\nCommands:\n/check DJ53G7TAZ1 — Verify a Telebirr payment\n/balance — Show your current balance\n/pending — (admin) List pending deposits\n/withdrawals — (admin) List pending withdrawals\n/help — This message\n\nOpen the Mini App to play Bingo.`, { parse_mode: "HTML" });
+    const uid = ctx.from.id;
+    let inviteInfo = "";
+    try {
+      const stats = await pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE referred_by = $1`, [uid]);
+      const count = stats.rows[0].count;
+      if (count > 0) {
+        inviteInfo = `\n\n👥 You've invited <b>${count}</b> friend${count === 1 ? "" : "s"} — earned <b>${count * REFERRAL_BONUS_INVITER} birr</b>!`;
+      }
+    } catch {}
+    await ctx.reply(
+      `🎱 <b>Zoma Bingo Bot</b>\n\nChoose an option below:${inviteInfo}`,
+      { parse_mode: "HTML", reply_markup: menuKeyboard() }
+    );
   });
 
-  bot.command("help", (ctx) => ctx.reply("Commands:\n/check <txId> — Verify a Telebirr transaction\n/balance — Show balance\n/pending — (admin) Pending deposits\n/withdrawals — (admin) Pending withdrawals"));
+  bot.command("help", async (ctx) => {
+    await ctx.reply(
+      `📖 <b>Help & Commands</b>\n\n` +
+      `/start — Show the menu\n` +
+      `/balance — Your balance\n` +
+      `/invite — Your referral link\n` +
+      `/check <txId> — Verify a Telebirr payment\n\n` +
+      `<i>Admin:</i> /pending, /withdrawals`,
+      { parse_mode: "HTML", reply_markup: menuKeyboard() }
+    );
+  });
 
   bot.command("balance", async (ctx) => {
-    try { const bal = await getBalance(ctx.from.id); await ctx.reply(`💰 Balance: <b>${bal} birr</b>`, { parse_mode: "HTML" }); }
-    catch { await ctx.reply("Could not load balance."); }
+    try {
+      const bal = await getBalance(ctx.from.id);
+      await ctx.reply(`💰 <b>Your Balance</b>\n\nYou have <b>${bal} birr</b>.`, { parse_mode: "HTML", reply_markup: menuKeyboard() });
+    } catch {
+      await ctx.reply("Could not load balance.", { reply_markup: menuKeyboard() });
+    }
+  });
+
+  bot.command("invite", async (ctx) => {
+    const uid = ctx.from.id;
+    const link = `https://t.me/${BOT_USERNAME}?start=ref_${uid}`;
+    const stats = await pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE referred_by = $1`, [uid]);
+    const count = stats.rows[0].count;
+    const earnings = count * REFERRAL_BONUS_INVITER;
+    const kb = new InlineKeyboard()
+      .url("📤 Share Link",
+        `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("Play Zoma Bingo and win birr! 🎱")}`)
+      .row()
+      .text("⬅️ Back", "menu:home");
+    await ctx.reply(
+      `👥 <b>Invite Friends</b>\n\n` +
+      `Your personal link:\n<code>${link}</code>\n\n` +
+      `🎁 Get <b>+${REFERRAL_BONUS_INVITER} birr</b> for every friend who joins\n\n` +
+      `📊 Friends invited: <b>${count}</b>\n` +
+      `💰 Total earned: <b>${earnings} birr</b>`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
   });
 
   bot.command("check", async (ctx) => {
@@ -674,31 +762,128 @@ if (ADMIN_BOT_TOKEN) {
     const txId = (args[0] || "").toUpperCase();
     if (!/^DJ[A-Z0-9]{6,}$/.test(txId)) return ctx.reply("Usage: /check DJ40FCM8GM");
     const tgId = ctx.from.id;
-    const existing = await pool.query(`SELECT type, status, amount, telegram_id FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
-    if (existing.rows.length && existing.rows[0].status === "approved") return ctx.reply(`✅ Already approved.\nAmount: ${existing.rows[0].amount} birr`);
+    const existing = await pool.query(`SELECT type, status, amount FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
+    if (existing.rows.length && existing.rows[0].status === "approved") return ctx.reply(`✅ Already approved. Amount: ${existing.rows[0].amount} birr`);
     if (existing.rows.length && existing.rows[0].type === "deposit_orphan") {
       const amount = Number(existing.rows[0].amount);
       const r = await claimOrphan({ txId, userId: tgId, amount });
       if (r.status === "approved") return ctx.reply(`✅ Deposit matched & credited!\n${amount} birr added.\nBalance: ${r.balance} birr`);
-      if (r.status === "mismatch") return ctx.reply(`❌ Amount mismatch. Contact support.`);
-      return ctx.reply(`❌ Could not claim. (${r.status})`);
+      if (r.status === "mismatch") return ctx.reply(`❌ Amount mismatch.`);
+      return ctx.reply(`❌ Could not claim.`);
     }
     const v = await verifyTelebirrReceipt(txId);
-    if (!v.ok) return ctx.reply(`❌ Could not verify <b>${txId}</b>\nReason: ${v.reason}\n\nIf you already paid, open the Mini App → Profile → Deposit and enter the TxID there.`, { parse_mode: "HTML" });
+    if (!v.ok) return ctx.reply(`❌ Could not verify <b>${txId}</b>\nReason: ${v.reason}`, { parse_mode: "HTML" });
     const dep = await pool.query(`SELECT id, amount FROM transactions WHERE telegram_id=$1 AND type='deposit' AND status='pending' LIMIT 1`, [tgId]);
     if (!dep.rows.length) {
-      await pool.query(`INSERT INTO transactions (telegram_id, type, amount, status, tx_id, note, auto) VALUES (0, 'deposit_orphan', $1, 'pending', $2, $3, TRUE) ON CONFLICT (tx_id) DO NOTHING`, [v.amount, txId, "Verified via /check by user " + tgId]);
-      return ctx.reply(`✅ Receipt verified: <b>${v.amount} birr</b>\n\nNow open the Mini App → Profile → Deposit and enter the same TxID: <code>${txId}</code>`, { parse_mode: "HTML" });
+      await pool.query(`INSERT INTO transactions (telegram_id, type, amount, status, tx_id, note, auto) VALUES (0, 'deposit_orphan', $1, 'pending', $2, $3, TRUE) ON CONFLICT (tx_id) DO NOTHING`, [v.amount, txId, "Verified via /check"]);
+      return ctx.reply(`✅ Receipt verified: <b>${v.amount} birr</b>\n\nNow open the Mini App to claim.`, { parse_mode: "HTML" });
     }
-    if (Number(dep.rows[0].amount) !== v.amount) return ctx.reply(`❌ Amount mismatch.\nYour claim: ${dep.rows[0].amount} birr\nReceipt: ${v.amount} birr`);
+    if (Number(dep.rows[0].amount) !== v.amount) return ctx.reply(`❌ Amount mismatch.`);
     const r = await creditDeposit({ txId, amount: v.amount, source: "auto", note: "Verified via /check" });
     if (r.status === "approved") return ctx.reply(`✅ Deposit approved!\n${v.amount} birr added.\nBalance: ${r.balance} birr`);
     return ctx.reply(`❌ ${r.status}`);
   });
 
+  // ---- Menu handlers ----
+  bot.callbackQuery("menu:balance", async (ctx) => {
+    try {
+      const bal = await getBalance(ctx.from.id);
+      const u = await pool.query(`SELECT first_name FROM users WHERE telegram_id=$1`, [ctx.from.id]);
+      const name = u.rows[0]?.first_name || "Player";
+      await ctx.answerCallbackQuery(`💰 ${bal} birr`);
+      await ctx.editMessageText(
+        `💰 <b>Your Balance</b>\n\nHi ${name}, you have <b>${bal} birr</b>.`,
+        { parse_mode: "HTML", reply_markup: menuKeyboard() }
+      );
+    } catch (e) {
+      console.error("menu:balance:", e);
+      await ctx.answerCallbackQuery("Error");
+    }
+  });
+
+  bot.callbackQuery("menu:deposit", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `💳 <b>Deposit to Zoma Bingo</b>\n\n` +
+      `1. Send money to <b>${TB_NUMBER}</b> (${TB_NAME}) via Telebirr\n` +
+      `2. Note the <b>Transaction ID</b> from the SMS (starts with <code>DJ</code>)\n` +
+      `3. Open the Mini App → Profile → Deposit\n` +
+      `4. Enter amount + TxID\n\n` +
+      `Your balance will be credited automatically.`,
+      { parse_mode: "HTML", reply_markup: menuKeyboard() }
+    );
+  });
+
+  bot.callbackQuery("menu:withdraw", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `💸 <b>Withdrawal to Telebirr</b>\n\n` +
+      `1. Open the Mini App → Profile → Withdraw\n` +
+      `2. Enter amount and your Telebirr phone number\n` +
+      `3. Tap Request withdrawal\n\n` +
+      `We'll send the money to your phone within a few minutes.`,
+      { parse_mode: "HTML", reply_markup: menuKeyboard() }
+    );
+  });
+
+  bot.callbackQuery("menu:play", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const kb = new InlineKeyboard()
+      .webApp("🎱 Open Bingo App", "https://zoma-production-246c.up.railway.app/")
+      .row()
+      .text("⬅️ Back", "menu:home");
+    await ctx.editMessageText(
+      `🎱 <b>Play Zoma Bingo</b>\n\nTap below to launch the game.`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+  });
+
+  bot.callbackQuery("menu:invite", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const uid = ctx.from.id;
+    const link = `https://t.me/${BOT_USERNAME}?start=ref_${uid}`;
+    const stats = await pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE referred_by = $1`, [uid]);
+    const count = stats.rows[0].count;
+    const earnings = count * REFERRAL_BONUS_INVITER;
+    const kb = new InlineKeyboard()
+      .url("📤 Share Link",
+        `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent("Play Zoma Bingo and win birr! 🎱")}`)
+      .row()
+      .text("⬅️ Back", "menu:home");
+    await ctx.editMessageText(
+      `👥 <b>Invite Friends</b>\n\n` +
+      `Your personal link:\n<code>${link}</code>\n\n` +
+      `🎁 Get <b>+${REFERRAL_BONUS_INVITER} birr</b> per friend who joins\n\n` +
+      `📊 Friends invited: <b>${count}</b>\n` +
+      `💰 Total earned: <b>${earnings} birr</b>`,
+      { parse_mode: "HTML", reply_markup: kb }
+    );
+  });
+
+  bot.callbackQuery("menu:home", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `🎱 <b>Zoma Bingo Bot</b>\n\nChoose an option below:`,
+      { parse_mode: "HTML", reply_markup: menuKeyboard() }
+    );
+  });
+
+  bot.callbackQuery("menu:help", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `📖 <b>Help & Commands</b>\n\n` +
+      `/start — Show the menu\n` +
+      `/balance — Your balance\n` +
+      `/invite — Referral link\n` +
+      `/check <txId> — Verify a Telebirr payment\n\n` +
+      `<i>Admin:</i> /pending, /withdrawals`,
+      { parse_mode: "HTML", reply_markup: menuKeyboard() }
+    );
+  });
+
+  // ---- Admin commands ----
   const isAdmin = (ctx) => String(ctx.from.id) === String(ADMIN_TG_ID) || String(ctx.chat.id) === String(ADMIN_TG_ID);
 
-  // ---- /pending — list pending deposits with buttons ----
   bot.command("pending", async (ctx) => {
     if (!isAdmin(ctx)) return;
     const r = await pool.query(`SELECT id, telegram_id, amount, tx_id FROM transactions WHERE type='deposit' AND status='pending' ORDER BY id ASC LIMIT 20`);
@@ -709,12 +894,11 @@ if (ADMIN_BOT_TOKEN) {
     await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
   });
 
-  // ---- /withdrawals — list pending withdrawals with buttons ----
   bot.command("withdrawals", async (ctx) => {
     if (!isAdmin(ctx)) return;
     const r = await pool.query(`SELECT id, telegram_id, amount, phone FROM transactions WHERE type='withdraw' AND status='pending' ORDER BY id ASC LIMIT 20`);
     if (!r.rows.length) return ctx.reply("No pending withdrawals.");
-    const lines = r.rows.map(x => `<b>#${x.id}</b> · <b>${x.amount} birr</b> → <code>${x.phone}</code>\nUser: ${x.telegram_id}`).join("\n\n");
+    const lines = r.rows.map(x => `<b>#${x.id}</b> · <b>${x.amount} birr</b> → <code>${x.phone}</code>`).join("\n\n");
     const kb = new InlineKeyboard();
     for (const x of r.rows.slice(0, 8)) kb.text(`✅ Paid #${x.id}`, `wpaid:${x.id}`).text(`❌ Reject #${x.id}`, `wreject:${x.id}`).row();
     await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
@@ -742,14 +926,12 @@ if (ADMIN_BOT_TOKEN) {
     if (!Number.isInteger(id) || id <= 0) return ctx.reply("Usage: /paid <id>");
     const r = await pool.query(`UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`, [id]);
     if (r.rows.length) {
-      await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr has been paid to your Telebirr.`);
+      await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr paid.`);
       await ctx.reply(`✅ Marked paid #${id}`);
-    } else {
-      await ctx.reply(`Not found or already handled.`);
-    }
+    } else await ctx.reply(`Not found.`);
   });
 
-  // ---- Deposit approve/reject buttons ----
+  // ---- Admin inline buttons ----
   bot.callbackQuery(/^approve:(\d+)$/, async (ctx) => {
     if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
     await approveById(Number(ctx.match[1]));
@@ -765,17 +947,14 @@ if (ADMIN_BOT_TOKEN) {
     try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
   });
 
-  // ---- Withdrawal paid/reject buttons ----
   bot.callbackQuery(/^wpaid:(\d+)$/, async (ctx) => {
     if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
     const id = Number(ctx.match[1]);
     const r = await pool.query(`UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`, [id]);
     if (r.rows.length) {
-      await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr has been paid to your Telebirr.`);
+      await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr has been paid.`);
       await ctx.answerCallbackQuery(`Marked paid`);
-    } else {
-      await ctx.answerCallbackQuery("Already handled");
-    }
+    } else await ctx.answerCallbackQuery("Already handled");
     try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
   });
 
@@ -790,13 +969,11 @@ if (ADMIN_BOT_TOKEN) {
         const { telegram_id, amount } = r.rows[0];
         await client.query(`UPDATE users SET balance=balance+$1 WHERE telegram_id=$2`, [amount, telegram_id]);
         await client.query(`UPDATE transactions SET status='rejected' WHERE id=$1`, [id]);
-        await tgNotify(telegram_id, `❌ Withdrawal ${amount} birr rejected. Funds returned to your balance.`);
+        await tgNotify(telegram_id, `❌ Withdrawal ${amount} birr rejected. Funds returned.`);
       }
       await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK");
-      console.error("wreject:", e);
-    } finally { client.release(); }
+    } catch (e) { await client.query("ROLLBACK"); console.error("wreject:", e); }
+    finally { client.release(); }
     await ctx.answerCallbackQuery("Rejected");
     try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
   });
@@ -834,10 +1011,10 @@ wss.on("connection", (ws) => {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === "auth") {
       const tg = validateInitData(msg.initData);
-      if (!tg) { try { ws.send(JSON.stringify({ type: "error", msg: "Invalid Telegram authentication" })); } catch {} return; }
+      if (!tg) { try { ws.send(JSON.stringify({ type: "error", msg: "Invalid auth" })); } catch {} return; }
       if (Number(tg.id) >= BOT_ID_BASE) { try { ws.send(JSON.stringify({ type: "error", msg: "Invalid user" })); } catch {} return; }
       ws.tgId = tg.id;
-      const { isNew, balance } = await ensureUser(tg);
+      const { isNew, balance } = await ensureUser(tg, tg.start_param);
       const names = [tg.first_name, tg.last_name].filter(Boolean).join(" ") || tg.username || `Player ${String(tg.id).slice(-4)}`;
       if (!game.players.has(tg.id)) game.players.set(tg.id, { names: [names], isBot: false });
       try { ws.send(JSON.stringify({ type: "balance", balance })); } catch {}
@@ -863,11 +1040,11 @@ wss.on("connection", (ws) => {
       }
       const take = valid.slice(0, room);
       const cost = take.length * CARD_PRICE;
-      if (!take.length) { try { ws.send(JSON.stringify({ type: "error", msg: "No valid cards to buy" })); } catch {} return; }
+      if (!take.length) { try { ws.send(JSON.stringify({ type: "error", msg: "No valid cards" })); } catch {} return; }
       for (const n of take) game.pendingCards.add(n);
       let client;
       try { client = await pool.connect(); }
-      catch (e) { for (const n of take) game.pendingCards.delete(n); console.error("join connection:", e); try { ws.send(JSON.stringify({ type: "error", msg: "DB unavailable" })); } catch {} return; }
+      catch (e) { for (const n of take) game.pendingCards.delete(n); try { ws.send(JSON.stringify({ type: "error", msg: "DB unavailable" })); } catch {} return; }
       try {
         await client.query("BEGIN");
         const u = await client.query(`SELECT balance FROM users WHERE telegram_id=$1 FOR UPDATE`, [ws.tgId]);
@@ -919,30 +1096,26 @@ app.get("/api/me", authMiddleware, async (req, res) => {
 
 app.get("/api/history", authMiddleware, async (req, res) => {
   try {
-    const r = await pool.query(`SELECT type AS kind, amount, status, created_at FROM transactions WHERE telegram_id=$1 AND type IN ('deposit','withdraw','win','promo','welcome_bonus') ORDER BY id DESC LIMIT 50`, [req.tgUser.id]);
+    const r = await pool.query(`SELECT type AS kind, amount, status, created_at FROM transactions WHERE telegram_id=$1 AND type IN ('deposit','withdraw','win','promo','welcome_bonus','referral') ORDER BY id DESC LIMIT 50`, [req.tgUser.id]);
     res.json({ items: r.rows.map(x => ({ ...x, amount: Number(x.amount) })) });
   } catch (err) { console.error(err); res.status(500).json({ error: "History failed" }); }
 });
 
 // ============================================================
-// DEPOSIT — endpoint (with Telegram admin buttons)
+// DEPOSIT — endpoint
 // ============================================================
 
 app.post("/api/deposit", authMiddleware, async (req, res) => {
   const amount = Number(req.body?.amount);
   const txId = String(req.body?.txId || "").trim().toUpperCase();
 
-  if (!Number.isFinite(amount) || amount < MIN_DEPOSIT || amount > MAX_DEPOSIT) {
-    return res.status(400).json({ error: `Amount must be between ${MIN_DEPOSIT} and ${MAX_DEPOSIT} birr` });
-  }
-  if (!txId || !/^DJ[A-Z0-9]{6,}$/.test(txId)) {
-    return res.status(400).json({ error: "Invalid transaction ID (should look like DJ40FCM8GM)" });
-  }
+  if (!Number.isFinite(amount) || amount < MIN_DEPOSIT || amount > MAX_DEPOSIT) return res.status(400).json({ error: `Amount must be between ${MIN_DEPOSIT} and ${MAX_DEPOSIT} birr` });
+  if (!txId || !/^DJ[A-Z0-9]{6,}$/.test(txId)) return res.status(400).json({ error: "Invalid transaction ID" });
 
   const tryClaim = async () => {
     const c = await claimOrphan({ txId, userId: req.tgUser.id, amount });
     if (c.status === "approved") return res.json({ status: "approved", amount, balance: c.balance });
-    if (c.status === "mismatch") return res.status(400).json({ error: "Amount doesn't match the payment received. Contact support." });
+    if (c.status === "mismatch") return res.status(400).json({ error: "Amount doesn't match." });
     return null;
   };
 
@@ -950,10 +1123,7 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
     const existing = await pool.query(`SELECT type, status FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
     if (existing.rows.length) {
       const e = existing.rows[0];
-      if (e.type === "deposit_orphan" && e.status === "pending") {
-        const handled = await tryClaim();
-        if (handled) return handled;
-      }
+      if (e.type === "deposit_orphan" && e.status === "pending") { const h = await tryClaim(); if (h) return h; }
       if (e.status === "approved") return res.status(400).json({ error: "Already approved" });
       return res.status(400).json({ error: "Already being processed" });
     }
@@ -963,12 +1133,12 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
       const ins = await pool.query(`INSERT INTO transactions (telegram_id, type, amount, status, tx_id) VALUES ($1, 'deposit', $2, 'pending', $3) RETURNING id`, [req.tgUser.id, amount, txId]);
       depId = ins.rows[0].id;
     } catch (e) {
-      if (e.code === "23505") { const handled = await tryClaim(); if (handled) return handled; return res.status(400).json({ error: "Already being processed" }); }
+      if (e.code === "23505") { const h = await tryClaim(); if (h) return h; return res.status(400).json({ error: "Already being processed" }); }
       throw e;
     }
 
     const v = await verifyTelebirrReceipt(txId);
-    console.log("💳 Deposit verification result:", { txId, userId: req.tgUser.id, requestedAmount: amount, verified: v.ok, receiptAmount: v.amount ?? null, receiver: v.receiver ?? null, status: v.status ?? null, reason: v.reason ?? null });
+    console.log("💳 Deposit verification result:", { txId, userId: req.tgUser.id, requestedAmount: amount, verified: v.ok, receiptAmount: v.amount ?? null, reason: v.reason ?? null });
 
     const normAmt = (x) => Math.round(Number(x) * 100);
     const amtMatches = v.ok && normAmt(v.amount) === normAmt(amount);
@@ -976,40 +1146,22 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
     if (amtMatches) {
       const result = await creditDeposit({ txId, amount, source: "auto", note: `Receipt verified (${v.status || "Completed"})` });
       if (result.status === "approved") return res.json({ status: "approved", amount, balance: result.balance });
-      if (result.status === "duplicate") return res.status(409).json({ error: "This payment has already been processed." });
-      console.warn("⚠️ Deposit not credited:", { txId, result: result.status });
+      if (result.status === "duplicate") return res.status(409).json({ error: "Already processed." });
     }
 
-    const reason = !v.ok
-      ? (v.reason || "Receipt verification failed")
-      : !amtMatches
-        ? `Amount mismatch: requested ${amount}, receipt ${v.amount}`
-        : "Credit not completed";
-
+    const reason = !v.ok ? (v.reason || "Verification failed") : !amtMatches ? `Amount mismatch` : "Not credited";
     await pool.query(`UPDATE transactions SET note=$1 WHERE id=$2 AND status='pending'`, [reason, depId]);
 
-    // ---- Notify admin with buttons ----
     if (ADMIN_TG_ID && bot) {
       try {
-        const kb = new InlineKeyboard()
-          .text(`✅ Approve #${depId}`, `approve:${depId}`)
-          .text(`❌ Reject #${depId}`, `reject:${depId}`);
-        await bot.api.sendMessage(
-          ADMIN_TG_ID,
-          `🔔 <b>Deposit needs review</b>\n` +
-          `<b>#${depId}</b> · User: ${req.tgUser.id}\n` +
-          `Amount: <b>${amount} birr</b>\n` +
-          `TxID: <code>${txId}</code>\n` +
-          `Reason: ${reason}\n\n` +
-          `👉 Verify in your Telebirr app, then tap ✅ or ❌`,
-          { parse_mode: "HTML", reply_markup: kb }
-        );
+        const kb = new InlineKeyboard().text(`✅ Approve #${depId}`, `approve:${depId}`).text(`❌ Reject #${depId}`, `reject:${depId}`);
+        await bot.api.sendMessage(ADMIN_TG_ID,
+          `🔔 <b>Deposit needs review</b>\n<b>#${depId}</b> · User: ${req.tgUser.id}\nAmount: <b>${amount} birr</b>\nTxID: <code>${txId}</code>\nReason: ${reason}\n\n👉 Verify in Telebirr, then tap ✅ or ❌`,
+          { parse_mode: "HTML", reply_markup: kb });
       } catch (e) {
         console.error("deposit notify:", e.message);
         await tgNotify(ADMIN_TG_ID, `🔔 Deposit needs review\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nTxID: ${txId}\nReason: ${reason}`);
       }
-    } else if (ADMIN_TG_ID) {
-      await tgNotify(ADMIN_TG_ID, `🔔 <b>Deposit needs review</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nTxID: ${txId}\nReason: ${reason}`);
     }
 
     return res.json({ status: "pending", depId });
@@ -1020,7 +1172,7 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// WITHDRAW — endpoint (with Telegram admin buttons)
+// WITHDRAW — endpoint
 // ============================================================
 
 app.post("/api/withdraw", authMiddleware, async (req, res) => {
@@ -1036,12 +1188,8 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
     const u = await client.query(`SELECT balance FROM users WHERE telegram_id=$1 FOR UPDATE`, [req.tgUser.id]);
     const bal = Number(u.rows[0]?.balance || 0);
     if (bal < amount) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Insufficient balance" }); }
-
     await client.query(`UPDATE users SET balance=balance-$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, req.tgUser.id]);
-    const ins = await client.query(
-      `INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3) RETURNING id`,
-      [req.tgUser.id, amount, phone]
-    );
+    const ins = await client.query(`INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3) RETURNING id`, [req.tgUser.id, amount, phone]);
     wdId = ins.rows[0].id;
     await client.query("COMMIT");
   } catch (err) {
@@ -1052,27 +1200,16 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
 
   const newBal = await getBalance(req.tgUser.id);
 
-  // ---- Notify admin with buttons ----
   if (ADMIN_TG_ID && bot && wdId) {
     try {
-      const kb = new InlineKeyboard()
-        .text(`✅ Mark paid #${wdId}`, `wpaid:${wdId}`)
-        .text(`❌ Reject #${wdId}`, `wreject:${wdId}`);
-      await bot.api.sendMessage(
-        ADMIN_TG_ID,
-        `💸 <b>Withdrawal request</b>\n` +
-        `<b>#${wdId}</b> · User: ${req.tgUser.id}\n` +
-        `Amount: <b>${amount} birr</b>\n` +
-        `Phone: <code>${phone}</code>\n\n` +
-        `👉 Send the money via Telebirr FIRST, then tap ✅`,
-        { parse_mode: "HTML", reply_markup: kb }
-      );
+      const kb = new InlineKeyboard().text(`✅ Mark paid #${wdId}`, `wpaid:${wdId}`).text(`❌ Reject #${wdId}`, `wreject:${wdId}`);
+      await bot.api.sendMessage(ADMIN_TG_ID,
+        `💸 <b>Withdrawal request</b>\n<b>#${wdId}</b> · User: ${req.tgUser.id}\nAmount: <b>${amount} birr</b>\nPhone: <code>${phone}</code>\n\n👉 Send the money via Telebirr FIRST, then tap ✅`,
+        { parse_mode: "HTML", reply_markup: kb });
     } catch (e) {
       console.error("withdraw notify:", e.message);
       await tgNotify(ADMIN_TG_ID, `💸 Withdrawal request\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
     }
-  } else if (ADMIN_TG_ID) {
-    await tgNotify(ADMIN_TG_ID, `💸 <b>Withdrawal request</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
   }
 
   res.json({ balance: newBal });
@@ -1092,7 +1229,7 @@ app.post("/api/promo", authMiddleware, async (req, res) => {
     if (!c.rows.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Invalid code" }); }
     const p = c.rows[0];
     if (!p.active) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Code expired" }); }
-    if (p.uses >= p.max_uses) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Code fully redeemed" }); }
+    if (p.uses >= p.max_uses) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Fully redeemed" }); }
     const used = await client.query(`SELECT 1 FROM promo_redemptions WHERE telegram_id=$1 AND code=$2`, [req.tgUser.id, code]);
     if (used.rows.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Already used" }); }
     const amt = Number(p.amount);
@@ -1121,7 +1258,7 @@ app.post("/webhook/sms", async (req, res) => {
   const txId = m[2].toUpperCase();
   if (!Number.isFinite(amount) || amount <= 0) return res.json({ ok: true, ignored: true });
   try {
-    const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via admin SMS forwarder" });
+    const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via SMS forwarder" });
     res.json({ ok: true, result: r });
   } catch (err) { console.error("sms webhook:", err); res.status(500).json({ ok: false, error: err.message }); }
 });
@@ -1146,7 +1283,7 @@ async function api(path, method="GET", body=null){const r = await fetch(path,{me
 function row(l, r){ return '<div class="row"><span>'+l+'</span>'+r+'</div>'; }
 async function load(){try{
   const d = await api("/api/admin/pending");
-  $("pending").innerHTML = d.items.length ? d.items.map(i=>row("<b>"+i.telegram_id+"</b> · "+i.amount+" birr<br><small>Tx: "+i.tx_id+" · "+new Date(i.created_at).toLocaleString()+"</small>", '<button data-id="'+i.id+'" class="ok">Approve</button> <button data-id="'+i.id+'" class="red no">Reject</button>')).join("") : "<small>No pending deposits.</small>";
+  $("pending").innerHTML = d.items.length ? d.items.map(i=>row("<b>"+i.telegram_id+"</b> · "+i.amount+" birr<br><small>Tx: "+i.tx_id+"</small>", '<button data-id="'+i.id+'" class="ok">Approve</button> <button data-id="'+i.id+'" class="red no">Reject</button>')).join("") : "<small>No pending deposits.</small>";
   const o = await api("/api/admin/orphans");
   $("orphans").innerHTML = o.items.length ? o.items.map(i=>row("<b>"+i.amount+" birr</b> · Tx: "+i.tx_id, '<small>'+(i.note||"")+'</small>')).join("") : "<small>None.</small>";
   const w = await api("/api/admin/withdrawals");
@@ -1187,30 +1324,28 @@ app.get("/api/admin/withdrawals", requireAdmin, async (req, res) => {
 });
 
 app.post("/api/admin/approve/:id", requireAdmin, async (req, res) => {
-  try {
-    await approveById(Number(req.params.id));
-    res.json({ ok: true });
-  } catch (e) { console.error("admin approve:", e); res.status(500).json({ error: "Approve failed" }); }
+  try { await approveById(Number(req.params.id)); res.json({ ok: true }); }
+  catch (e) { console.error(e); res.status(500).json({ error: "Failed" }); }
 });
 
 app.post("/api/admin/reject/:id", requireAdmin, async (req, res) => {
   try {
-    const reason = String(req.body?.reason || "Rejected by admin");
+    const reason = String(req.body?.reason || "Rejected");
     const dep = await pool.query(`SELECT telegram_id, amount FROM transactions WHERE id=$1 AND status='pending'`, [req.params.id]);
     if (!dep.rows.length) return res.status(400).json({ error: "Not pending" });
     await pool.query(`UPDATE transactions SET status='rejected', note=$1 WHERE id=$2`, [reason, req.params.id]);
     await tgNotify(dep.rows[0].telegram_id, `❌ Deposit ${dep.rows[0].amount} birr rejected: ${reason}`);
     res.json({ ok: true });
-  } catch (e) { console.error("admin reject:", e); res.status(500).json({ error: "Reject failed" }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: "Failed" }); }
 });
 
 app.post("/api/admin/withdraw-paid/:id", requireAdmin, async (req, res) => {
   try {
     const r = await pool.query(`UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`, [req.params.id]);
     if (!r.rows.length) return res.status(400).json({ error: "Not pending" });
-    await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr paid to your Telebirr.`);
+    await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr paid.`);
     res.json({ ok: true });
-  } catch (e) { console.error("withdraw paid:", e); res.status(500).json({ error: "Failed" }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: "Failed" }); }
 });
 
 app.post("/api/admin/withdraw-reject/:id", requireAdmin, async (req, res) => {
@@ -1225,7 +1360,7 @@ app.post("/api/admin/withdraw-reject/:id", requireAdmin, async (req, res) => {
     await client.query("COMMIT");
     await tgNotify(telegram_id, `❌ Withdrawal ${amount} birr rejected. Funds returned.`);
     res.json({ ok: true });
-  } catch (e) { await client.query("ROLLBACK"); console.error("withdraw reject:", e); res.status(500).json({ error: "Failed" }); }
+  } catch (e) { await client.query("ROLLBACK"); console.error(e); res.status(500).json({ error: "Failed" }); }
   finally { client.release(); }
 });
 
@@ -1245,11 +1380,11 @@ app.use((req, res, next) => {
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🎱 Zoma Bingo on :${PORT}`);
   console.log(`💵 CARD_PRICE=${CARD_PRICE}  🏆 HOUSE_CUT=${HOUSE_CUT}`);
-  console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}  💰 BOT_BALANCE=${BOT_BALANCE}`);
-  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr  🏆 POPUP=${WINNER_POPUP_SECONDS}s`);
+  console.log(`👥 MIN_PLAYERS=${MIN_PLAYERS_TO_START}  🤖 BOT_COUNT=${BOT_COUNT}`);
+  console.log(`🎁 WELCOME_BONUS=${WELCOME_BONUS} birr  |  🎉 REFERRAL_BONUS=${REFERRAL_BONUS_INVITER} birr`);
   console.log(`💳 Telebirr: ${TB_NUMBER} (${TB_NAME})`);
-  console.log(`🔐 Admin: /admin  |  SMS webhook: POST /webhook/sms?secret=***`);
-  console.log(`🔎 Receipt verification: TB_RECEIVER_NAME="${TB_RECEIVER_NAME}"  AGE=unlimited`);
+  console.log(`🤖 Bot username: @${BOT_USERNAME}`);
+  console.log(`🔎 Receipt: TB_RECEIVER_NAME="${TB_RECEIVER_NAME}"  AGE=unlimited`);
 
   try {
     await initDatabase();
@@ -1259,13 +1394,13 @@ server.listen(PORT, "0.0.0.0", async () => {
 
     if (bot) {
       setTimeout(() => {
-        console.log("🤖 Starting bot polling in 8s to avoid 409 conflict…");
+        console.log("🤖 Starting bot polling in 8s…");
         bot.start({
           onStart: (info) => console.log(`🤖 Bot @${info.username} polling started`),
           drop_pending_updates: true
         }).catch((err) => {
           if (err?.error_code === 409) {
-            console.warn("⚠️ Bot polling conflict — retrying in 20s…");
+            console.warn("⚠️ Bot 409 — retrying in 20s…");
             setTimeout(() => bot.start({ drop_pending_updates: true }).catch(() => {}), 20000);
           } else {
             console.error("bot start error:", err.message);
