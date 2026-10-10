@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-11 — unlimited receipt age, hardened verify
+// Updated: 2026-10-11 — Telegram admin notifications with action buttons
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-11");
@@ -46,8 +46,7 @@ const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
 const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
 
-// Receipt verification — full name for stricter anti-fraud.
-// Set in Railway → Variables → TB_RECEIVER_NAME = "helen yohaness bitew"
+// Full receiver name for stricter anti-fraud
 const TB_RECEIVER_NAME = String(process.env.TB_RECEIVER_NAME || "helen yohaness bitew").trim().toLowerCase();
 
 // ============================================================
@@ -121,6 +120,27 @@ async function tgNotify(chatId, text) {
     const j = await res.json();
     if (!j.ok) console.error(`❌ tgNotify failed for ${chatId}:`, j.description);
   } catch (e) { console.error("❌ tgNotify error:", e.message); }
+}
+
+// Send a message with inline buttons
+async function tgNotifyButtons(chatId, text, keyboard) {
+  if (!ADMIN_BOT_TOKEN || !chatId) return;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: String(chatId),
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: keyboard
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const j = await res.json();
+    if (!j.ok) console.error(`❌ tgNotifyButtons failed for ${chatId}:`, j.description);
+  } catch (e) { console.error("❌ tgNotifyButtons error:", e.message); }
 }
 
 // ============================================================
@@ -519,16 +539,13 @@ async function verifyTelebirrReceipt(txId) {
     const lines = htmlToLines(html);
     const text = lines.join(" ");
 
-    // 1) Page must mention this txId
     if (!text.toUpperCase().includes(txId)) return { ok: false, reason: "Tx id not found on page" };
 
-    // 2) Status must be explicitly successful
     const status = fieldAfter(lines, /^(?:transaction\s*status|status)\s*[:\-]?\s*(.*)$/i);
     if (!/^(completed|success|successful)$/i.test(status)) {
       return { ok: false, reason: `Status "${status || "missing"}"` };
     }
 
-    // 3) Amount from a labeled field only
     const amountRaw =
       fieldAfter(lines, /^(?:settled\s*amount)\s*[:\-]?\s*(.*)$/i) ||
       fieldAfter(lines, /^(?:transaction\s*amount)\s*[:\-]?\s*(.*)$/i) ||
@@ -539,7 +556,6 @@ async function verifyTelebirrReceipt(txId) {
       return { ok: false, reason: "Could not read amount" };
     }
 
-    // 4) Receiver name must include your full account name
     const receiver = fieldAfter(
       lines,
       /^(?:credited\s*party\s*name|receiver(?:\s*name)?)\s*[:\-]?\s*(.*)$/i
@@ -548,15 +564,11 @@ async function verifyTelebirrReceipt(txId) {
       return { ok: false, reason: `Receiver mismatch (${receiver.slice(0, 40) || "missing"})` };
     }
 
-    // 5) Receiving account number must appear on the page
     const digitsOnly = lines.join(" ").replace(/\D/g, "");
     const myDigits = TB_NUMBER.replace(/\D/g, "");
     if (myDigits.length >= 8 && !digitsOnly.includes(myDigits)) {
       return { ok: false, reason: "Receiver account number not on page" };
     }
-
-    // NOTE: No age check — receipts of any age are accepted as long as they
-    // haven't been claimed before (enforced by the UNIQUE index on tx_id).
 
     return { ok: true, amount, receiver, status: "Completed" };
   } catch (e) {
@@ -647,10 +659,10 @@ if (ADMIN_BOT_TOKEN) {
   bot = new Bot(ADMIN_BOT_TOKEN);
 
   bot.command("start", async (ctx) => {
-    await ctx.reply(`🎱 <b>Zoma Bingo Bot</b>\n\nCommands:\n/check DJ53G7TAZ1 — Verify a Telebirr payment\n/balance — Show your current balance\n/help — This message\n\nOpen the Mini App to play Bingo.`, { parse_mode: "HTML" });
+    await ctx.reply(`🎱 <b>Zoma Bingo Bot</b>\n\nCommands:\n/check DJ53G7TAZ1 — Verify a Telebirr payment\n/balance — Show your current balance\n/pending — (admin) List pending deposits\n/withdrawals — (admin) List pending withdrawals\n/help — This message\n\nOpen the Mini App to play Bingo.`, { parse_mode: "HTML" });
   });
 
-  bot.command("help", (ctx) => ctx.reply("Commands:\n/check <txId> — Verify a Telebirr transaction\n/balance — Show balance"));
+  bot.command("help", (ctx) => ctx.reply("Commands:\n/check <txId> — Verify a Telebirr transaction\n/balance — Show balance\n/pending — (admin) Pending deposits\n/withdrawals — (admin) Pending withdrawals"));
 
   bot.command("balance", async (ctx) => {
     try { const bal = await getBalance(ctx.from.id); await ctx.reply(`💰 Balance: <b>${bal} birr</b>`, { parse_mode: "HTML" }); }
@@ -686,6 +698,7 @@ if (ADMIN_BOT_TOKEN) {
 
   const isAdmin = (ctx) => String(ctx.from.id) === String(ADMIN_TG_ID) || String(ctx.chat.id) === String(ADMIN_TG_ID);
 
+  // ---- /pending — list pending deposits with buttons ----
   bot.command("pending", async (ctx) => {
     if (!isAdmin(ctx)) return;
     const r = await pool.query(`SELECT id, telegram_id, amount, tx_id FROM transactions WHERE type='deposit' AND status='pending' ORDER BY id ASC LIMIT 20`);
@@ -693,6 +706,17 @@ if (ADMIN_BOT_TOKEN) {
     const lines = r.rows.map(x => `<b>#${x.id}</b> · ${x.amount} birr · user ${x.telegram_id}\nTx: <code>${x.tx_id}</code>`).join("\n\n");
     const kb = new InlineKeyboard();
     for (const x of r.rows.slice(0, 8)) kb.text(`✅ #${x.id}`, `approve:${x.id}`).text(`❌ #${x.id}`, `reject:${x.id}`).row();
+    await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
+  });
+
+  // ---- /withdrawals — list pending withdrawals with buttons ----
+  bot.command("withdrawals", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    const r = await pool.query(`SELECT id, telegram_id, amount, phone FROM transactions WHERE type='withdraw' AND status='pending' ORDER BY id ASC LIMIT 20`);
+    if (!r.rows.length) return ctx.reply("No pending withdrawals.");
+    const lines = r.rows.map(x => `<b>#${x.id}</b> · <b>${x.amount} birr</b> → <code>${x.phone}</code>\nUser: ${x.telegram_id}`).join("\n\n");
+    const kb = new InlineKeyboard();
+    for (const x of r.rows.slice(0, 8)) kb.text(`✅ Paid #${x.id}`, `wpaid:${x.id}`).text(`❌ Reject #${x.id}`, `wreject:${x.id}`).row();
     await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
   });
 
@@ -712,6 +736,20 @@ if (ADMIN_BOT_TOKEN) {
     await ctx.reply(`❌ Rejected #${id}`);
   });
 
+  bot.command("paid", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    const id = Number((ctx.match || "").trim());
+    if (!Number.isInteger(id) || id <= 0) return ctx.reply("Usage: /paid <id>");
+    const r = await pool.query(`UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`, [id]);
+    if (r.rows.length) {
+      await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr has been paid to your Telebirr.`);
+      await ctx.reply(`✅ Marked paid #${id}`);
+    } else {
+      await ctx.reply(`Not found or already handled.`);
+    }
+  });
+
+  // ---- Deposit approve/reject buttons ----
   bot.callbackQuery(/^approve:(\d+)$/, async (ctx) => {
     if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
     await approveById(Number(ctx.match[1]));
@@ -723,6 +761,42 @@ if (ADMIN_BOT_TOKEN) {
     if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
     const id = Number(ctx.match[1]);
     await pool.query(`UPDATE transactions SET status='rejected', note='Rejected via bot' WHERE id=$1 AND status='pending'`, [id]);
+    await ctx.answerCallbackQuery("Rejected");
+    try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+  });
+
+  // ---- Withdrawal paid/reject buttons ----
+  bot.callbackQuery(/^wpaid:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
+    const id = Number(ctx.match[1]);
+    const r = await pool.query(`UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`, [id]);
+    if (r.rows.length) {
+      await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr has been paid to your Telebirr.`);
+      await ctx.answerCallbackQuery(`Marked paid`);
+    } else {
+      await ctx.answerCallbackQuery("Already handled");
+    }
+    try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+  });
+
+  bot.callbackQuery(/^wreject:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
+    const id = Number(ctx.match[1]);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const r = await client.query(`SELECT telegram_id, amount FROM transactions WHERE id=$1 AND type='withdraw' AND status='pending' FOR UPDATE`, [id]);
+      if (r.rows.length) {
+        const { telegram_id, amount } = r.rows[0];
+        await client.query(`UPDATE users SET balance=balance+$1 WHERE telegram_id=$2`, [amount, telegram_id]);
+        await client.query(`UPDATE transactions SET status='rejected' WHERE id=$1`, [id]);
+        await tgNotify(telegram_id, `❌ Withdrawal ${amount} birr rejected. Funds returned to your balance.`);
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("wreject:", e);
+    } finally { client.release(); }
     await ctx.answerCallbackQuery("Rejected");
     try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
   });
@@ -851,7 +925,7 @@ app.get("/api/history", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// DEPOSIT — endpoint
+// DEPOSIT — endpoint (with Telegram admin buttons)
 // ============================================================
 
 app.post("/api/deposit", authMiddleware, async (req, res) => {
@@ -894,35 +968,15 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
     }
 
     const v = await verifyTelebirrReceipt(txId);
-
-    console.log("💳 Deposit verification result:", {
-      txId,
-      userId: req.tgUser.id,
-      requestedAmount: amount,
-      verified: v.ok,
-      receiptAmount: v.amount ?? null,
-      receiver: v.receiver ?? null,
-      status: v.status ?? null,
-      reason: v.reason ?? null
-    });
+    console.log("💳 Deposit verification result:", { txId, userId: req.tgUser.id, requestedAmount: amount, verified: v.ok, receiptAmount: v.amount ?? null, receiver: v.receiver ?? null, status: v.status ?? null, reason: v.reason ?? null });
 
     const normAmt = (x) => Math.round(Number(x) * 100);
     const amtMatches = v.ok && normAmt(v.amount) === normAmt(amount);
 
     if (amtMatches) {
-      const result = await creditDeposit({
-        txId,
-        amount,
-        source: "auto",
-        note: `Receipt verified (${v.status || "Completed"})`
-      });
-
-      if (result.status === "approved") {
-        return res.json({ status: "approved", amount, balance: result.balance });
-      }
-      if (result.status === "duplicate") {
-        return res.status(409).json({ error: "This payment has already been processed." });
-      }
+      const result = await creditDeposit({ txId, amount, source: "auto", note: `Receipt verified (${v.status || "Completed"})` });
+      if (result.status === "approved") return res.json({ status: "approved", amount, balance: result.balance });
+      if (result.status === "duplicate") return res.status(409).json({ error: "This payment has already been processed." });
       console.warn("⚠️ Deposit not credited:", { txId, result: result.status });
     }
 
@@ -934,13 +988,28 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 
     await pool.query(`UPDATE transactions SET note=$1 WHERE id=$2 AND status='pending'`, [reason, depId]);
 
-    if (ADMIN_TG_ID) {
-      await tgNotify(ADMIN_TG_ID,
-        `🔔 <b>Deposit needs review</b>\n` +
-        `User: ${req.tgUser.id}\n` +
-        `Amount: ${amount} birr\n` +
-        `TxID: ${txId}\n` +
-        `Reason: ${reason}`);
+    // ---- Notify admin with buttons ----
+    if (ADMIN_TG_ID && bot) {
+      try {
+        const kb = new InlineKeyboard()
+          .text(`✅ Approve #${depId}`, `approve:${depId}`)
+          .text(`❌ Reject #${depId}`, `reject:${depId}`);
+        await bot.api.sendMessage(
+          ADMIN_TG_ID,
+          `🔔 <b>Deposit needs review</b>\n` +
+          `<b>#${depId}</b> · User: ${req.tgUser.id}\n` +
+          `Amount: <b>${amount} birr</b>\n` +
+          `TxID: <code>${txId}</code>\n` +
+          `Reason: ${reason}\n\n` +
+          `👉 Verify in your Telebirr app, then tap ✅ or ❌`,
+          { parse_mode: "HTML", reply_markup: kb }
+        );
+      } catch (e) {
+        console.error("deposit notify:", e.message);
+        await tgNotify(ADMIN_TG_ID, `🔔 Deposit needs review\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nTxID: ${txId}\nReason: ${reason}`);
+      }
+    } else if (ADMIN_TG_ID) {
+      await tgNotify(ADMIN_TG_ID, `🔔 <b>Deposit needs review</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nTxID: ${txId}\nReason: ${reason}`);
     }
 
     return res.json({ status: "pending", depId });
@@ -951,7 +1020,7 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// WITHDRAW
+// WITHDRAW — endpoint (with Telegram admin buttons)
 // ============================================================
 
 app.post("/api/withdraw", authMiddleware, async (req, res) => {
@@ -959,20 +1028,54 @@ app.post("/api/withdraw", authMiddleware, async (req, res) => {
   const phone = String(req.body?.phone || "").trim();
   if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
   if (!/^0?9\d{8}$/.test(phone)) return res.status(400).json({ error: "Invalid Telebirr phone number" });
+
   const client = await pool.connect();
+  let wdId = null;
   try {
     await client.query("BEGIN");
     const u = await client.query(`SELECT balance FROM users WHERE telegram_id=$1 FOR UPDATE`, [req.tgUser.id]);
     const bal = Number(u.rows[0]?.balance || 0);
     if (bal < amount) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Insufficient balance" }); }
+
     await client.query(`UPDATE users SET balance=balance-$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, req.tgUser.id]);
-    await client.query(`INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3)`, [req.tgUser.id, amount, phone]);
+    const ins = await client.query(
+      `INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3) RETURNING id`,
+      [req.tgUser.id, amount, phone]
+    );
+    wdId = ins.rows[0].id;
     await client.query("COMMIT");
-    const newBal = await getBalance(req.tgUser.id);
-    if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID, `💸 <b>Withdrawal request</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
-    res.json({ balance: newBal });
-  } catch (err) { await client.query("ROLLBACK"); console.error(err); res.status(500).json({ error: "Withdrawal failed" }); }
-  finally { client.release(); }
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(err);
+    return res.status(500).json({ error: "Withdrawal failed" });
+  } finally { client.release(); }
+
+  const newBal = await getBalance(req.tgUser.id);
+
+  // ---- Notify admin with buttons ----
+  if (ADMIN_TG_ID && bot && wdId) {
+    try {
+      const kb = new InlineKeyboard()
+        .text(`✅ Mark paid #${wdId}`, `wpaid:${wdId}`)
+        .text(`❌ Reject #${wdId}`, `wreject:${wdId}`);
+      await bot.api.sendMessage(
+        ADMIN_TG_ID,
+        `💸 <b>Withdrawal request</b>\n` +
+        `<b>#${wdId}</b> · User: ${req.tgUser.id}\n` +
+        `Amount: <b>${amount} birr</b>\n` +
+        `Phone: <code>${phone}</code>\n\n` +
+        `👉 Send the money via Telebirr FIRST, then tap ✅`,
+        { parse_mode: "HTML", reply_markup: kb }
+      );
+    } catch (e) {
+      console.error("withdraw notify:", e.message);
+      await tgNotify(ADMIN_TG_ID, `💸 Withdrawal request\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
+    }
+  } else if (ADMIN_TG_ID) {
+    await tgNotify(ADMIN_TG_ID, `💸 <b>Withdrawal request</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
+  }
+
+  res.json({ balance: newBal });
 });
 
 // ============================================================
@@ -1085,22 +1188,7 @@ app.get("/api/admin/withdrawals", requireAdmin, async (req, res) => {
 
 app.post("/api/admin/approve/:id", requireAdmin, async (req, res) => {
   try {
-    const dep = await pool.query(`SELECT id, telegram_id, amount, status FROM transactions WHERE id=$1`, [req.params.id]);
-    if (!dep.rows.length) return res.status(404).json({ error: "Not found" });
-    if (dep.rows[0].status !== "pending") return res.status(400).json({ error: "Already handled" });
-    const { telegram_id, amount } = dep.rows[0];
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, telegram_id]);
-      await client.query(`UPDATE transactions SET status='approved', auto=FALSE, note='Manual admin approval' WHERE id=$1`, [dep.rows[0].id]);
-      await client.query("COMMIT");
-    } catch (e) { await client.query("ROLLBACK"); throw e; }
-    finally { client.release(); }
-    const bal = await getBalance(telegram_id);
-    for (const ws of wss.clients) if (String(ws.tgId) === String(telegram_id) && ws.readyState === 1)
-      try { ws.send(JSON.stringify({ type: "balance", balance: bal })); ws.send(JSON.stringify({ type: "error", msg: `✅ Deposit ${amount} birr approved!` })); } catch {}
-    await tgNotify(telegram_id, `✅ Deposit ${amount} birr approved. New balance: ${bal} birr`);
+    await approveById(Number(req.params.id));
     res.json({ ok: true });
   } catch (e) { console.error("admin approve:", e); res.status(500).json({ error: "Approve failed" }); }
 });
