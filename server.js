@@ -481,8 +481,12 @@ async function addBots() {
 async function startRound() {
   if (game.phase === "playing" || game.phase === "over") return;
 
-  await addBots();
+  // Lock purchases before the async bot setup so no player can buy a card
+  // number at the same time a bot is choosing its card numbers.
   game.phase = "playing";
+  game.countdown = null;
+  sendState();
+  await addBots();
   game.countdown = null;
   sendState();
 
