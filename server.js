@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-10 — Telebirr auto-approval + SMS webhook + admin panel
+// Updated: 2026-10-10 — stable startup, instant /health, bulk bot seed
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-10");
@@ -43,17 +43,15 @@ const WELCOME_BONUS = Number(process.env.WELCOME_BONUS || 100);
 const BOT_COUNT = Number(process.env.BOT_COUNT || 100);
 const BOT_BALANCE = Number(process.env.BOT_BALANCE || 10000);
 
-// Telebirr receiving account
 const TB_NUMBER = process.env.TB_NUMBER || "0982372677";
 const TB_NAME = process.env.TB_NAME || "Zoma Bingo";
 
-// Deposit limits
 const MIN_DEPOSIT = Number(process.env.MIN_DEPOSIT || 10);
 const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
 const RECEIPT_MAX_AGE_HOURS = Number(process.env.RECEIPT_MAX_AGE_HOURS || 24);
 
 // ============================================================
-// REALISTIC BOT NAMES
+// BOT NAMES
 // ============================================================
 
 const FIRST_NAMES = [
@@ -72,10 +70,8 @@ const FIRST_NAMES = [
   "Obsa", "Rukiya", "Tariku", "Feyisa", "Lelisa", "Senay", "Mosisa", "Firaol",
   "Gemechu", "Kuulani", "Robel", "Nardos", "Abdi", "Iman", "Mustafa", "Halima"
 ];
-
 const LAST_INITIALS = [
-  "A", "B", "T", "M", "G", "K", "H", "D", "S", "Y",
-  "W", "N", "F", "R", "L", "Z", "E", "C", "O", "J"
+  "A","B","T","M","G","K","H","D","S","Y","W","N","F","R","L","Z","E","C","O","J"
 ];
 
 function pickBotName(i) {
@@ -132,19 +128,30 @@ function extractInitData(req) {
 }
 
 // ============================================================
-// TELEGRAM NOTIFY HELPER
+// TELEGRAM NOTIFY
 // ============================================================
 
 async function tgNotify(chatId, text) {
-  if (!ADMIN_BOT_TOKEN || !chatId) return;
+  if (!ADMIN_BOT_TOKEN || !chatId) {
+    console.warn("tgNotify skipped: no token or chatId");
+    return;
+  }
   try {
-    await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" })
+      body: JSON.stringify({
+        chat_id: String(chatId),
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      }),
+      signal: AbortSignal.timeout(8000)
     });
+    const j = await res.json();
+    if (!j.ok) console.error(`❌ tgNotify failed for ${chatId}:`, j.description);
   } catch (e) {
-    console.error("tg notify:", e.message);
+    console.error("❌ tgNotify error:", e.message);
   }
 }
 
@@ -160,30 +167,17 @@ async function ensureUser(tgUser) {
 
   if (existing.rows.length) {
     await pool.query(
-      `UPDATE users
-       SET username = $1, first_name = $2, last_name = $3, updated_at = NOW()
-       WHERE telegram_id = $4`,
-      [
-        tgUser.username || null,
-        tgUser.first_name || null,
-        tgUser.last_name || null,
-        tgUser.id
-      ]
+      `UPDATE users SET username=$1, first_name=$2, last_name=$3, updated_at=NOW()
+       WHERE telegram_id=$4`,
+      [tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, tgUser.id]
     );
     return { isNew: false, balance: Number(existing.rows[0].balance) };
   }
 
   const inserted = await pool.query(
     `INSERT INTO users (telegram_id, username, first_name, last_name, balance)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING balance`,
-    [
-      tgUser.id,
-      tgUser.username || null,
-      tgUser.first_name || null,
-      tgUser.last_name || null,
-      WELCOME_BONUS
-    ]
+     VALUES ($1, $2, $3, $4, $5) RETURNING balance`,
+    [tgUser.id, tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, WELCOME_BONUS]
   );
 
   if (WELCOME_BONUS > 0) {
@@ -194,19 +188,14 @@ async function ensureUser(tgUser) {
     );
   }
 
-  console.log(
-    `🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id} (${tgUser.first_name || tgUser.username || "new"})`
-  );
-
+  console.log(`🎁 Welcome bonus ${WELCOME_BONUS} birr → user ${tgUser.id} (${tgUser.first_name || tgUser.username || "new"})`);
   return { isNew: true, balance: Number(inserted.rows[0].balance) };
 }
 
 async function authMiddleware(req, res, next) {
   try {
     const tgUser = validateInitData(extractInitData(req));
-    if (!tgUser) {
-      return res.status(401).json({ error: "Invalid Telegram Mini App authentication" });
-    }
+    if (!tgUser) return res.status(401).json({ error: "Invalid Telegram Mini App authentication" });
     req.tgUser = tgUser;
     const { isNew } = await ensureUser(tgUser);
     req.isNewUser = isNew;
@@ -226,6 +215,28 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, "public")));
+
+// ============================================================
+// HEALTH CHECK — INSTANT, NO DB, MUST BE FIRST
+// Railway pings this every few seconds. If it's slow, it kills
+// the container. Never query Postgres here.
+// ============================================================
+
+let startupReady = false;
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    ready: startupReady,
+    uptime: Math.floor(process.uptime()),
+    game: game?.phase || "starting",
+    bots: BOT_COUNT
+  });
+});
+
+// ============================================================
+// RATE LIMIT
+// ============================================================
 
 const apiLimiter = rateLimit({
   windowMs: 1000,
@@ -269,10 +280,7 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-
-  await pool.query(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;
-  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
@@ -288,16 +296,11 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-
-  // Extend existing table (safe on re-deploy)
   await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT;`);
   await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS auto BOOLEAN NOT NULL DEFAULT FALSE;`);
-
-  // Unique index on tx_id (partial, so legacy NULL rows are allowed)
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS transactions_tx_id_unique
-      ON transactions (tx_id)
-      WHERE tx_id IS NOT NULL;
+      ON transactions (tx_id) WHERE tx_id IS NOT NULL;
   `);
 
   await pool.query(`
@@ -310,7 +313,6 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS promo_redemptions (
       id SERIAL PRIMARY KEY,
@@ -335,7 +337,6 @@ async function initDatabase() {
     );
   `);
 
-  // Seed default promo codes (only if table is empty)
   const pc = await pool.query(`SELECT COUNT(*)::int AS n FROM promo_codes`);
   if (pc.rows[0].n === 0) {
     await pool.query(`
@@ -352,30 +353,39 @@ async function initDatabase() {
 }
 
 // ============================================================
-// BOT SEEDING
+// BOT SEEDING — BULK INSERT, ONE QUERY
 // ============================================================
 
 const BOT_ID_BASE = 9000000000000;
 
 async function seedBots() {
-  console.log(`🤖 Seeding ${BOT_COUNT} bots with ${BOT_BALANCE} birr each…`);
-
-  for (let i = 0; i < BOT_COUNT; i++) {
-    const botId = BOT_ID_BASE + i;
-    const botName = pickBotName(i);
-    await pool.query(
-      `INSERT INTO users (telegram_id, username, first_name, balance, is_bot)
-       VALUES ($1, $2, $3, $4, TRUE)
-       ON CONFLICT (telegram_id)
-       DO UPDATE SET
-         first_name = $3,
-         balance = $4,
-         is_bot = TRUE,
-         updated_at = NOW()`,
-      [botId, null, botName, BOT_BALANCE]
-    );
+  // Skip if already seeded
+  const existing = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM users WHERE is_bot = TRUE`
+  );
+  if (existing.rows[0].n >= BOT_COUNT) {
+    console.log(`✅ ${existing.rows[0].n} bots already in DB — skipping seed`);
+    return;
   }
 
+  console.log(`🤖 Seeding ${BOT_COUNT} bots (bulk insert)…`);
+  const values = [];
+  const params = [];
+  for (let i = 0; i < BOT_COUNT; i++) {
+    const b = i * 4;
+    values.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, TRUE)`);
+    params.push(BOT_ID_BASE + i, null, pickBotName(i), BOT_BALANCE);
+  }
+  await pool.query(
+    `INSERT INTO users (telegram_id, username, first_name, balance, is_bot)
+     VALUES ${values.join(",")}
+     ON CONFLICT (telegram_id) DO UPDATE
+       SET first_name = EXCLUDED.first_name,
+           balance    = EXCLUDED.balance,
+           is_bot     = TRUE,
+           updated_at = NOW()`,
+    params
+  );
   console.log(`✅ ${BOT_COUNT} named bots ready (each ${BOT_BALANCE} birr)`);
 }
 
@@ -436,18 +446,14 @@ function drawnPrize() {
 function publicState(forTgId) {
   const cardsForUser = [];
   for (const entry of game.cards.values()) {
-    if (String(entry.owner) === String(forTgId)) cardsForUser.push({ no: entry.cardNo, card: cardFor(entry.cardNo) });
+    if (String(entry.owner) === String(forTgId)) {
+      cardsForUser.push({ no: entry.cardNo, card: cardFor(entry.cardNo) });
+    }
   }
-
-  const taken = [...new Set([...game.cards.values()].map(entry => entry.cardNo).concat([...game.pendingCards]))];
+  const taken = [...new Set([...game.cards.values()].map(e => e.cardNo).concat([...game.pendingCards]))];
 
   const winnerPayload = game.winner
-    ? {
-        names: game.winner.names,
-        prize: game.winner.prize,
-        card: game.winner.card,
-        you: game.winner.tgId === forTgId
-      }
+    ? { names: game.winner.names, prize: game.winner.prize, card: game.winner.card, you: game.winner.tgId === forTgId }
     : null;
 
   return {
@@ -456,7 +462,7 @@ function publicState(forTgId) {
     countdown: game.countdown,
     drawn: game.drawn,
     prize: drawnPrize(),
-    players: [...game.players.values()].filter((p) => !p.isBot).length,
+    players: [...game.players.values()].filter(p => !p.isBot).length,
     bots: game.bots.length,
     taken,
     max: MAX_CARDS_PER_PLAYER,
@@ -532,23 +538,55 @@ function startCountdown() {
 
 async function addBots() {
   game.bots = [];
+  // Track taken numbers locally so we don't hit the DB
+  const taken = new Set([...game.cards.values()].map(e => e.cardNo));
+  const updates = [];
+
   for (let i = 0; i < BOT_COUNT; i++) {
-    const botTgId = BOT_ID_BASE + i, botName = pickBotName(i), botCards = [];
+    const botTgId = BOT_ID_BASE + i;
+    const botName = pickBotName(i);
+    const botCards = [];
     const nCards = 1 + Math.floor(Math.random() * 2);
+
     for (let k = 0; k < nCards; k++) {
       let n = 0, attempts = 0;
       do { n = 1 + Math.floor(Math.random() * TOTAL_CARDS); attempts++; }
-      while (([...game.cards.values()].some(entry => entry.cardNo === n) || game.pendingCards.has(n) || botCards.includes(n)) && attempts < 2000);
-      if ([...game.cards.values()].some(entry => entry.cardNo === n) || game.pendingCards.has(n) || botCards.includes(n)) break;
+      while ((taken.has(n) || game.pendingCards.has(n) || botCards.includes(n)) && attempts < 2000);
+      if (taken.has(n) || game.pendingCards.has(n) || botCards.includes(n)) break;
       botCards.push(n);
+      taken.add(n);
       game.cards.set(`${botTgId}:${n}`, { cardNo: n, owner: botTgId });
-      sendState();
     }
     game.bots.push({ id: i, tgId: botTgId, names: [botName], cards: botCards });
+
+    if (botCards.length) {
+      updates.push([botCards.length * CARD_PRICE, botTgId]);
+    }
+  }
+
+  // Do NOT call sendState() inside the loop — one final sendState() happens
+  // at the end of startLobby(). This removes 100+ wasted broadcasts.
+
+  // Bulk update bot balances in one query
+  if (updates.length) {
     try {
-      await pool.query(`UPDATE users SET balance = GREATEST(0, balance - $1), updated_at = NOW() WHERE telegram_id = $2`,
-        [botCards.length * CARD_PRICE, botTgId]);
-    } catch (err) { console.error("bot card purchase:", err); }
+      const values = [];
+      const params = [];
+      updates.forEach(([cost, id], i) => {
+        const b = i * 2;
+        values.push(`($${b + 1}::numeric, $${b + 2}::bigint)`);
+        params.push(cost, id);
+      });
+      await pool.query(`
+        UPDATE users SET
+          balance = GREATEST(0, balance - v.cost),
+          updated_at = NOW()
+        FROM (VALUES ${values.join(",")}) AS v(cost, id)
+        WHERE users.telegram_id = v.id
+      `, params);
+    } catch (err) {
+      console.error("bot card purchase bulk:", err.message);
+    }
   }
 }
 
@@ -565,9 +603,7 @@ async function startRound() {
        VALUES ((SELECT COALESCE(MAX(round_number),0)+1 FROM rounds), 'playing', $1, $2)`,
       [game.drawn, drawnPrize()]
     );
-  } catch (err) {
-    console.error("round insert:", err);
-  }
+  } catch (err) { console.error("round insert:", err); }
 
   game.callTimer = setInterval(callNext, CALL_INTERVAL_MS);
   setTimeout(callNext, 1500);
@@ -578,7 +614,6 @@ function callNext() {
 
   const remaining = [];
   for (let n = 1; n <= 75; n++) if (!game.drawnSet.has(n)) remaining.push(n);
-
   if (!remaining.length) return finishRound(null);
 
   const n = remaining[Math.floor(Math.random() * remaining.length)];
@@ -608,9 +643,11 @@ function findWinners() {
     const ownerNum = Number(entry.owner), isBot = ownerNum >= BOT_ID_BASE;
     const bot = isBot ? game.bots.find(b => b.tgId === ownerNum) : null;
     const player = game.players.get(ownerNum);
-    found.push({ names: isBot ? (bot ? bot.names : [pickBotName(ownerNum - BOT_ID_BASE)]) :
-      (player ? player.names : ["Player"]), card: entry.cardNo, tgId: ownerNum,
-      owner: entry.owner, pattern, isBot });
+    found.push({
+      names: isBot ? (bot ? bot.names : [pickBotName(ownerNum - BOT_ID_BASE)]) :
+        (player ? player.names : ["Player"]),
+      card: entry.cardNo, tgId: ownerNum, owner: entry.owner, pattern, isBot
+    });
   }
   const seen = new Set();
   return found.filter(w => { const k = String(w.owner); if (seen.has(k)) return false; seen.add(k); return true; });
@@ -631,7 +668,7 @@ async function finishRound(winners) {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE telegram_id = $2`, [share, winner.tgId]);
+      await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [share, winner.tgId]);
       await client.query(`INSERT INTO transactions (telegram_id, type, amount, status) VALUES ($1,'win',$2,'completed')`, [winner.tgId, share]);
       await client.query("COMMIT");
     } catch (e) { await client.query("ROLLBACK"); console.error("payout:", e); }
@@ -639,8 +676,10 @@ async function finishRound(winners) {
   }
 
   broadcastWinnerPopup({
-    winners: allWinners.map(w => ({ names: w.names, cardNo: w.card, prize: share, pattern: w.pattern,
-      isBot: w.isBot, card: cardFor(w.card) })),
+    winners: allWinners.map(w => ({
+      names: w.names, cardNo: w.card, prize: share, pattern: w.pattern,
+      isBot: w.isBot, card: cardFor(w.card)
+    })),
     names: allWinners.flatMap(w => w.names), cardNo: allWinners[0]?.card ?? null, prize: poolPrize,
     isBot: allWinners.length > 0 && allWinners.every(w => w.isBot),
     card: allWinners[0] ? cardFor(allWinners[0].card) : null, drawn: game.drawn,
@@ -657,7 +696,6 @@ async function finishRound(winners) {
   } catch (err) { console.error("round update:", err); }
 
   sendState();
-
   for (const winner of allWinners) if (winner.tgId) {
     const balance = await getBalance(winner.tgId);
     for (const ws of wss.clients) if (String(ws.tgId) === String(winner.tgId) && ws.readyState === 1)
@@ -679,12 +717,10 @@ async function getBalance(tgId) {
 }
 
 // ============================================================
-// DEPOSIT AUTO-VERIFY (receipt scraper — optional)
+// DEPOSIT VERIFY
 // ============================================================
 
 async function verifyTelebirrReceipt(txId) {
-  // Try the official receipt page. It's an SPA, so we look for a JSON endpoint
-  // first; if that fails, we give up and fall through to manual review.
   try {
     const url = `https://transactioninfo.ethiotelecom.et/api/receipt/${encodeURIComponent(txId)}`;
     const r = await fetch(url, {
@@ -697,65 +733,40 @@ async function verifyTelebirrReceipt(txId) {
     });
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
     const d = await r.json();
-
     const amount = Number(d.amount ?? d.transactionAmount ?? 0);
     const receiver = String(d.receiverName ?? d.receiver ?? "").trim();
     const status = String(d.status ?? d.transactionStatus ?? "").toLowerCase();
     const dateStr = d.date ?? d.transactionDate ?? null;
-
-    if (!amount) return { ok: false, reason: "No amount in receipt" };
-    if (!["completed", "success", "successful"].includes(status))
-      return { ok: false, reason: `Status "${status}"` };
-
+    if (!amount) return { ok: false, reason: "No amount" };
+    if (!["completed","success","successful"].includes(status)) return { ok: false, reason: `Status "${status}"` };
     if (dateStr) {
       const ts = Date.parse(dateStr);
       if (!Number.isNaN(ts)) {
         const ageH = (Date.now() - ts) / 36e5;
-        if (ageH > RECEIPT_MAX_AGE_HOURS)
-          return { ok: false, reason: `Receipt older than ${RECEIPT_MAX_AGE_HOURS}h` };
+        if (ageH > RECEIPT_MAX_AGE_HOURS) return { ok: false, reason: "Too old" };
       }
     }
-
     return { ok: true, amount, receiver, status, date: dateStr };
   } catch (e) {
     return { ok: false, reason: e.message };
   }
 }
 
-// ============================================================
-// CORE: process a verified incoming payment
-// ============================================================
-
-/**
- * Called from the SMS webhook OR the receipt verifier.
- * Finds a matching pending deposit (by txId or amount),
- * credits the user, marks the deposit approved.
- */
 async function creditDeposit({ txId, amount, source = "auto", note = null }) {
-  // Already credited?
-  const dupe = await pool.query(
-    `SELECT id, status FROM transactions WHERE tx_id = $1 LIMIT 1`,
-    [txId]
-  );
-  if (dupe.rows.length) {
-    if (dupe.rows[0].status === "approved") {
-      return { status: "duplicate", message: "Already approved" };
-    }
+  const dupe = await pool.query(`SELECT id, status FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
+  if (dupe.rows.length && dupe.rows[0].status === "approved") {
+    return { status: "duplicate", message: "Already approved" };
   }
 
-  // Find matching pending deposit
   let pending = await pool.query(
     `SELECT id, telegram_id, amount FROM transactions
-     WHERE tx_id = $1 AND type = 'deposit' AND status = 'pending' LIMIT 1`,
+     WHERE tx_id=$1 AND type='deposit' AND status='pending' LIMIT 1`,
     [txId]
   );
-
-  // Fallback: match by amount within the last 30 minutes
   if (!pending.rows.length) {
     pending = await pool.query(
       `SELECT id, telegram_id, amount FROM transactions
-       WHERE type = 'deposit' AND status = 'pending'
-         AND amount = $1
+       WHERE type='deposit' AND status='pending' AND amount=$1
          AND created_at > NOW() - INTERVAL '30 minutes'
        ORDER BY created_at ASC LIMIT 1`,
       [amount]
@@ -763,61 +774,38 @@ async function creditDeposit({ txId, amount, source = "auto", note = null }) {
   }
 
   if (!pending.rows.length) {
-    // Orphan receipt — save for admin to see
     await pool.query(
       `INSERT INTO transactions (telegram_id, type, amount, status, tx_id, note, auto)
        VALUES (0, 'deposit_orphan', $1, 'pending', $2, $3, $4)`,
       [amount, txId, note || `Unmatched ${source} receipt`, source === "auto"]
     );
-    if (ADMIN_TG_ID) {
-      await tgNotify(ADMIN_TG_ID,
-        `⚠️ <b>Orphan ${source} receipt</b>\n` +
-        `Amount: ${amount} birr\nTxID: ${txId}\n` +
-        `No matching pending deposit.`);
-    }
-    return { status: "orphan", message: "No matching deposit" };
+    if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
+      `⚠️ <b>Orphan ${source} receipt</b>\nAmount: ${amount} birr\nTxID: ${txId}`);
+    return { status: "orphan" };
   }
 
   const dep = pending.rows[0];
-
-  // Amount sanity check
   if (Number(dep.amount) !== Number(amount)) {
-    await pool.query(
-      `UPDATE transactions SET status='pending', note=$1 WHERE id=$2`,
-      [`Amount mismatch: claimed ${dep.amount}, received ${amount}`, dep.id]
-    );
-    if (ADMIN_TG_ID) {
-      await tgNotify(ADMIN_TG_ID,
-        `⚠️ <b>Amount mismatch</b>\n` +
-        `User ${dep.telegram_id}\nClaimed: ${dep.amount} birr\nReceived: ${amount} birr\nTxID: ${txId}`);
-    }
-    return { status: "mismatch", message: "Amount mismatch" };
+    await pool.query(`UPDATE transactions SET note=$1 WHERE id=$2`,
+      [`Amount mismatch: claimed ${dep.amount}, got ${amount}`, dep.id]);
+    return { status: "mismatch" };
   }
 
-  // Credit
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query(
-      `UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE telegram_id = $2`,
-      [amount, dep.telegram_id]
-    );
-    await client.query(
-      `UPDATE transactions SET status='approved', tx_id=$1, auto=$2, note=$3 WHERE id=$4`,
-      [txId, source === "auto", note, dep.id]
-    );
+    await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`,
+      [amount, dep.telegram_id]);
+    await client.query(`UPDATE transactions SET status='approved', tx_id=$1, auto=$2, note=$3 WHERE id=$4`,
+      [txId, source === "auto", note, dep.id]);
     await client.query("COMMIT");
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("credit deposit:", e);
-    return { status: "error", message: "DB error" };
-  } finally {
-    client.release();
-  }
+    return { status: "error" };
+  } finally { client.release(); }
 
   const newBal = await getBalance(dep.telegram_id);
-
-  // Notify player
   for (const ws of wss.clients) {
     if (String(ws.tgId) === String(dep.telegram_id) && ws.readyState === 1) {
       try {
@@ -826,15 +814,12 @@ async function creditDeposit({ txId, amount, source = "auto", note = null }) {
       } catch {}
     }
   }
-  await tgNotify(dep.telegram_id, `✅ <b>Deposit approved</b>\n${amount} birr added to your balance.\nNew balance: ${newBal} birr`);
-
-  if (ADMIN_TG_ID) {
-    await tgNotify(ADMIN_TG_ID,
-      `✅ <b>Deposit approved (${source})</b>\nUser: ${dep.telegram_id}\nAmount: ${amount} birr\nTxID: ${txId}`);
-  }
+  await tgNotify(dep.telegram_id, `✅ Deposit approved: ${amount} birr. New balance: ${newBal} birr`);
+  if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
+    `✅ <b>Deposit approved (${source})</b>\nUser: ${dep.telegram_id}\nAmount: ${amount} birr\nTxID: ${txId}`);
 
   console.log(`💰 Deposit ${amount} birr approved for ${dep.telegram_id} (${source}) TxID=${txId}`);
-  return { status: "approved", balance: newBal, telegram_id: dep.telegram_id };
+  return { status: "approved", balance: newBal };
 }
 
 // ============================================================
@@ -843,6 +828,8 @@ async function creditDeposit({ txId, amount, source = "auto", note = null }) {
 
 wss.on("connection", (ws) => {
   ws.tgId = null;
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
 
   ws.on("message", async (raw) => {
     let msg;
@@ -854,49 +841,31 @@ wss.on("connection", (ws) => {
         try { ws.send(JSON.stringify({ type: "error", msg: "Invalid Telegram authentication" })); } catch {}
         return;
       }
-
       if (Number(tg.id) >= BOT_ID_BASE) {
         try { ws.send(JSON.stringify({ type: "error", msg: "Invalid user" })); } catch {}
         return;
       }
 
       ws.tgId = tg.id;
-
       const { isNew, balance } = await ensureUser(tg);
       const names = [tg.first_name, tg.last_name].filter(Boolean).join(" ") || tg.username || `Player ${String(tg.id).slice(-4)}`;
-      if (!game.players.has(tg.id)) {
-        game.players.set(tg.id, { names: [names], isBot: false });
-      }
+      if (!game.players.has(tg.id)) game.players.set(tg.id, { names: [names], isBot: false });
 
       try { ws.send(JSON.stringify({ type: "balance", balance })); } catch {}
       try { ws.send(JSON.stringify(publicState(tg.id))); } catch {}
+      if (isNew) try { ws.send(JSON.stringify({ type: "error", msg: `🎁 Welcome! You got ${WELCOME_BONUS} birr free.` })); } catch {}
 
-      if (isNew) {
-        try { ws.send(JSON.stringify({ type: "error", msg: `🎁 Welcome! You got ${WELCOME_BONUS} birr free.` })); } catch {}
-      }
-
-      if (game.phase === "lobby" && !game.botSetup && !game.lobbyTimer && game.players.size >= 1) {
-        startCountdown();
-      }
+      if (game.phase === "lobby" && !game.botSetup && !game.lobbyTimer && game.players.size >= 1) startCountdown();
       return;
     }
 
     if (msg.type === "join") {
-      if (!ws.tgId) {
-        try { ws.send(JSON.stringify({ type: "error", msg: "Not authenticated" })); } catch {}
-        return;
-      }
-      if (game.phase !== "lobby") {
-        try { ws.send(JSON.stringify({ type: "error", msg: "Round already started" })); } catch {}
-        return;
-      }
+      if (!ws.tgId) { try { ws.send(JSON.stringify({ type: "error", msg: "Not authenticated" })); } catch {} return; }
+      if (game.phase !== "lobby") { try { ws.send(JSON.stringify({ type: "error", msg: "Round already started" })); } catch {} return; }
 
       const requested = Array.isArray(msg.cards) ? msg.cards : [];
       const player = game.players.get(ws.tgId);
-      if (!player) {
-        try { ws.send(JSON.stringify({ type: "error", msg: "Not registered" })); } catch {}
-        return;
-      }
+      if (!player) { try { ws.send(JSON.stringify({ type: "error", msg: "Not registered" })); } catch {} return; }
 
       const owned = [...game.cards.values()].filter(e => String(e.owner) === String(ws.tgId)).map(e => e.cardNo);
       const taken = new Set([...game.cards.values()].map(e => e.cardNo));
@@ -910,28 +879,20 @@ wss.on("connection", (ws) => {
       }
       const take = valid.slice(0, room);
       const cost = take.length * CARD_PRICE;
-
-      if (!take.length) {
-        try { ws.send(JSON.stringify({ type: "error", msg: "No valid cards to buy" })); } catch {}
-        return;
-      }
+      if (!take.length) { try { ws.send(JSON.stringify({ type: "error", msg: "No valid cards to buy" })); } catch {} return; }
 
       for (const n of take) game.pendingCards.add(n);
       let client;
-      try {
-        client = await pool.connect();
-      } catch (e) {
+      try { client = await pool.connect(); }
+      catch (e) {
         for (const n of take) game.pendingCards.delete(n);
         console.error("join connection:", e);
-        try { ws.send(JSON.stringify({ type: "error", msg: "Could not connect to the database" })); } catch {}
+        try { ws.send(JSON.stringify({ type: "error", msg: "DB unavailable" })); } catch {}
         return;
       }
       try {
         await client.query("BEGIN");
-        const u = await client.query(
-          `SELECT balance FROM users WHERE telegram_id = $1 FOR UPDATE`,
-          [ws.tgId]
-        );
+        const u = await client.query(`SELECT balance FROM users WHERE telegram_id=$1 FOR UPDATE`, [ws.tgId]);
         const bal = Number(u.rows[0]?.balance || 0);
         if (bal < cost) {
           await client.query("ROLLBACK");
@@ -939,15 +900,9 @@ wss.on("connection", (ws) => {
           try { ws.send(JSON.stringify({ type: "error", msg: `Not enough balance. Need ${cost} birr.` })); } catch {}
           return;
         }
-        await client.query(
-          `UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE telegram_id = $2`,
-          [cost, ws.tgId]
-        );
+        await client.query(`UPDATE users SET balance=balance-$1, updated_at=NOW() WHERE telegram_id=$2`, [cost, ws.tgId]);
         for (const n of take) {
-          await client.query(
-            `INSERT INTO transactions (telegram_id, type, amount, status) VALUES ($1,'card',$2,'completed')`,
-            [ws.tgId, CARD_PRICE]
-          );
+          await client.query(`INSERT INTO transactions (telegram_id, type, amount, status) VALUES ($1,'card',$2,'completed')`, [ws.tgId, CARD_PRICE]);
         }
         await client.query("COMMIT");
       } catch (e) {
@@ -956,9 +911,7 @@ wss.on("connection", (ws) => {
         for (const n of take) game.pendingCards.delete(n);
         try { ws.send(JSON.stringify({ type: "error", msg: "Could not buy cards" })); } catch {}
         return;
-      } finally {
-        client.release();
-      }
+      } finally { client.release(); }
 
       for (const n of take) {
         game.pendingCards.delete(n);
@@ -967,10 +920,7 @@ wss.on("connection", (ws) => {
 
       try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
       sendState();
-
-      if (!game.lobbyTimer && game.phase === "lobby" && game.cards.size > 0) {
-        startCountdown();
-      }
+      if (!game.lobbyTimer && game.phase === "lobby" && game.cards.size > 0) startCountdown();
       return;
     }
   });
@@ -979,6 +929,15 @@ wss.on("connection", (ws) => {
   ws.on("error", () => {});
 });
 
+// Heartbeat — terminate dead sockets
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30000);
+
 // ============================================================
 // REST — USER
 // ============================================================
@@ -986,7 +945,7 @@ wss.on("connection", (ws) => {
 app.get("/api/me", authMiddleware, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT telegram_id, username, first_name, last_name, balance FROM users WHERE telegram_id = $1`,
+      `SELECT telegram_id, username, first_name, last_name, balance FROM users WHERE telegram_id=$1`,
       [req.tgUser.id]
     );
     const u = r.rows[0];
@@ -996,30 +955,23 @@ app.get("/api/me", authMiddleware, async (req, res) => {
       tb: { number: TB_NUMBER, name: TB_NAME },
       limits: { min: MIN_DEPOSIT, max: MAX_DEPOSIT }
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Unable to load user" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "Unable to load user" }); }
 });
 
 app.get("/api/history", authMiddleware, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT type AS kind, amount, status, created_at
-       FROM transactions
-       WHERE telegram_id = $1 AND type IN ('deposit','withdraw','win','promo','welcome_bonus')
+      `SELECT type AS kind, amount, status, created_at FROM transactions
+       WHERE telegram_id=$1 AND type IN ('deposit','withdraw','win','promo','welcome_bonus')
        ORDER BY id DESC LIMIT 50`,
       [req.tgUser.id]
     );
     res.json({ items: r.rows.map(x => ({ ...x, amount: Number(x.amount) })) });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "History failed" });
-  }
+  } catch (err) { console.error(err); res.status(500).json({ error: "History failed" }); }
 });
 
 // ============================================================
-// DEPOSIT — request + auto-verify attempt
+// DEPOSIT
 // ============================================================
 
 app.post("/api/deposit", authMiddleware, async (req, res) => {
@@ -1034,19 +986,12 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
   }
 
   try {
-    // Fast duplicate check
-    const dupe = await pool.query(
-      `SELECT id, status FROM transactions WHERE tx_id = $1 LIMIT 1`,
-      [txId]
-    );
+    const dupe = await pool.query(`SELECT id, status FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
     if (dupe.rows.length) {
-      if (dupe.rows[0].status === "approved") {
-        return res.status(400).json({ error: "This transaction was already approved" });
-      }
-      return res.status(400).json({ error: "This transaction ID is already being processed" });
+      if (dupe.rows[0].status === "approved") return res.status(400).json({ error: "Already approved" });
+      return res.status(400).json({ error: "Already being processed" });
     }
 
-    // Insert as pending first
     const ins = await pool.query(
       `INSERT INTO transactions (telegram_id, type, amount, status, tx_id)
        VALUES ($1, 'deposit', $2, 'pending', $3) RETURNING id`,
@@ -1054,30 +999,18 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
     );
     const depId = ins.rows[0].id;
 
-    // Try auto-verify via receipt endpoint
     const v = await verifyTelebirrReceipt(txId);
     if (v.ok && Number(v.amount) === amount) {
       const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via receipt" });
-      if (r.status === "approved") {
-        return res.json({ status: "approved", amount, balance: r.balance });
-      }
+      if (r.status === "approved") return res.json({ status: "approved", amount, balance: r.balance });
     }
 
-    // Fall through to manual review
-    if (ADMIN_TG_ID) {
-      await tgNotify(ADMIN_TG_ID,
-        `🔔 <b>New deposit (pending)</b>\n` +
-        `User: ${req.tgUser.id} (${req.tgUser.first_name || req.tgUser.username || "?"})\n` +
-        `Amount: ${amount} birr\nTxID: ${txId}\n` +
-        `Auto-verify: ${v.ok ? "matched amount but not credited" : v.reason}\n` +
-        `Approve with: /approve_${depId}`);
-    }
+    if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
+      `🔔 <b>New deposit (pending)</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nTxID: ${txId}\n` +
+      `Auto: ${v.ok ? "matched but not credited" : v.reason}`);
 
     res.json({ status: "pending", depId });
-  } catch (err) {
-    console.error("deposit:", err);
-    res.status(500).json({ error: "Deposit failed" });
-  }
+  } catch (err) { console.error("deposit:", err); res.status(500).json({ error: "Deposit failed" }); }
 });
 
 // ============================================================
@@ -1087,59 +1020,34 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 app.post("/api/withdraw", authMiddleware, async (req, res) => {
   const amount = Number(req.body?.amount);
   const phone = String(req.body?.phone || "").trim();
-
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return res.status(400).json({ error: "Invalid amount" });
-  }
-  if (!/^0?9\d{8}$/.test(phone)) {
-    return res.status(400).json({ error: "Invalid Telebirr phone number" });
-  }
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+  if (!/^0?9\d{8}$/.test(phone)) return res.status(400).json({ error: "Invalid Telebirr phone number" });
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const u = await client.query(
-      `SELECT balance FROM users WHERE telegram_id = $1 FOR UPDATE`,
-      [req.tgUser.id]
-    );
+    const u = await client.query(`SELECT balance FROM users WHERE telegram_id=$1 FOR UPDATE`, [req.tgUser.id]);
     const bal = Number(u.rows[0]?.balance || 0);
+    if (bal < amount) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Insufficient balance" }); }
 
-    if (bal < amount) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Insufficient balance" });
-    }
-
-    await client.query(
-      `UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE telegram_id = $2`,
-      [amount, req.tgUser.id]
-    );
-    await client.query(
-      `INSERT INTO transactions (telegram_id, type, amount, status, phone)
-       VALUES ($1, 'withdraw', $2, 'pending', $3)`,
-      [req.tgUser.id, amount, phone]
-    );
-
+    await client.query(`UPDATE users SET balance=balance-$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, req.tgUser.id]);
+    await client.query(`INSERT INTO transactions (telegram_id, type, amount, status, phone) VALUES ($1,'withdraw',$2,'pending',$3)`,
+      [req.tgUser.id, amount, phone]);
     await client.query("COMMIT");
+
     const newBal = await getBalance(req.tgUser.id);
-
-    if (ADMIN_TG_ID) {
-      await tgNotify(ADMIN_TG_ID,
-        `💸 <b>Withdrawal request</b>\n` +
-        `User: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
-    }
-
+    if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
+      `💸 <b>Withdrawal request</b>\nUser: ${req.tgUser.id}\nAmount: ${amount} birr\nPhone: ${phone}`);
     res.json({ balance: newBal });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
     res.status(500).json({ error: "Withdrawal failed" });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 // ============================================================
-// PROMO CODE
+// PROMO
 // ============================================================
 
 app.post("/api/promo", authMiddleware, async (req, res) => {
@@ -1149,36 +1057,21 @@ app.post("/api/promo", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const c = await client.query(
-      `SELECT code, amount, max_uses, uses, active FROM promo_codes WHERE code = $1 FOR UPDATE`,
-      [code]
-    );
+    const c = await client.query(`SELECT code, amount, max_uses, uses, active FROM promo_codes WHERE code=$1 FOR UPDATE`, [code]);
     if (!c.rows.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Invalid code" }); }
     const p = c.rows[0];
     if (!p.active) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Code expired" }); }
     if (p.uses >= p.max_uses) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Code fully redeemed" }); }
 
-    const used = await client.query(
-      `SELECT 1 FROM promo_redemptions WHERE telegram_id = $1 AND code = $2`,
-      [req.tgUser.id, code]
-    );
-    if (used.rows.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "You already used this code" }); }
+    const used = await client.query(`SELECT 1 FROM promo_redemptions WHERE telegram_id=$1 AND code=$2`, [req.tgUser.id, code]);
+    if (used.rows.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Already used" }); }
 
     const amt = Number(p.amount);
-    await client.query(`UPDATE promo_codes SET uses = uses + 1 WHERE code = $1`, [code]);
-    await client.query(
-      `INSERT INTO promo_redemptions (telegram_id, code) VALUES ($1, $2)`,
-      [req.tgUser.id, code]
-    );
-    await client.query(
-      `UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE telegram_id = $2`,
-      [amt, req.tgUser.id]
-    );
-    await client.query(
-      `INSERT INTO transactions (telegram_id, type, amount, status, note)
-       VALUES ($1, 'promo', $2, 'completed', $3)`,
-      [req.tgUser.id, amt, `Promo ${code}`]
-    );
+    await client.query(`UPDATE promo_codes SET uses=uses+1 WHERE code=$1`, [code]);
+    await client.query(`INSERT INTO promo_redemptions (telegram_id, code) VALUES ($1,$2)`, [req.tgUser.id, code]);
+    await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [amt, req.tgUser.id]);
+    await client.query(`INSERT INTO transactions (telegram_id, type, amount, status, note) VALUES ($1,'promo',$2,'completed',$3)`,
+      [req.tgUser.id, amt, `Promo ${code}`]);
     await client.query("COMMIT");
 
     const newBal = await getBalance(req.tgUser.id);
@@ -1187,13 +1080,11 @@ app.post("/api/promo", authMiddleware, async (req, res) => {
     await client.query("ROLLBACK");
     console.error("promo:", err);
     res.status(500).json({ error: "Promo failed" });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 // ============================================================
-// SMS FORWARDER WEBHOOK  (admin phone → server)
+// SMS WEBHOOK
 // ============================================================
 
 app.post("/webhook/sms", async (req, res) => {
@@ -1205,27 +1096,15 @@ app.post("/webhook/sms", async (req, res) => {
   const text = String(req.body?.text || req.body?.message || "");
   console.log("📩 SMS:", text.slice(0, 200));
 
-  // Sample Telebirr credit SMS:
-  //   "You have received 100.00 birr from 0911223344 (Abebe). Your balance is 550.00 birr. Transaction ID DJ53G7TAZ1."
-  const m = text.match(
-    /received\s+([\d.,]+)\s*birr[\s\S]*?Transaction\s*ID\s*[: ]?\s*(DJ[A-Z0-9]{6,})/i
-  );
+  const m = text.match(/received\s+([\d.,]+)\s*birr[\s\S]*?Transaction\s*ID\s*[: ]?\s*(DJ[A-Z0-9]{6,})/i);
   if (!m) return res.json({ ok: true, ignored: true });
 
   const amount = Number(m[1].replace(/,/g, ""));
   const txId = m[2].toUpperCase();
-
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return res.json({ ok: true, ignored: true });
-  }
+  if (!Number.isFinite(amount) || amount <= 0) return res.json({ ok: true, ignored: true });
 
   try {
-    const r = await creditDeposit({
-      txId,
-      amount,
-      source: "auto",
-      note: "Auto-verified via admin SMS forwarder"
-    });
+    const r = await creditDeposit({ txId, amount, source: "auto", note: "Auto-verified via admin SMS forwarder" });
     res.json({ ok: true, result: r });
   } catch (err) {
     console.error("sms webhook:", err);
@@ -1234,7 +1113,7 @@ app.post("/webhook/sms", async (req, res) => {
 });
 
 // ============================================================
-// ADMIN PANEL (simple password-protected HTML page)
+// ADMIN
 // ============================================================
 
 const adminHtml = `<!doctype html>
@@ -1251,11 +1130,6 @@ button.red{background:#e8453c}
 button.blue{background:#2f6bff}
 small{color:#a9acd9}
 input{width:100%;padding:10px;border-radius:10px;border:2px solid #3a3f86;background:#171a43;color:#fff;font:inherit}
-.tag{display:inline-block;padding:2px 8px;border-radius:8px;font-size:12px;font-weight:800}
-.pending{background:#f2b01e;color:#111}
-.approved{background:#22a06b}
-.rejected{background:#e8453c}
-.orphan{background:#8e4dff}
 </style></head><body>
 <h1>🛠️ Zoma Admin</h1>
 <div class="card">
@@ -1264,9 +1138,9 @@ input{width:100%;padding:10px;border-radius:10px;border:2px solid #3a3f86;backgr
   <button class="blue" id="login" style="margin-top:8px">Load</button>
   <small id="whoami"></small>
 </div>
-<div class="card" id="pendingBox"><h3>Pending deposits</h3><div id="pending">Login to load…</div></div>
-<div class="card" id="orphanBox"><h3>Orphan receipts (unmatched)</h3><div id="orphans">Login to load…</div></div>
-<div class="card" id="wdBox"><h3>Pending withdrawals</h3><div id="withdrawals">Login to load…</div></div>
+<div class="card"><h3>Pending deposits</h3><div id="pending">Login to load…</div></div>
+<div class="card"><h3>Orphan receipts</h3><div id="orphans">Login to load…</div></div>
+<div class="card"><h3>Pending withdrawals</h3><div id="withdrawals">Login to load…</div></div>
 <script>
 const $ = (id) => document.getElementById(id);
 let pw = "";
@@ -1279,28 +1153,18 @@ async function load(){
   try{
     const d = await api("/api/admin/pending");
     $("pending").innerHTML = d.items.length ? d.items.map(i=>
-      row(
-        "<b>"+i.telegram_id+"</b> · "+i.amount+" birr<br><small>Tx: "+i.tx_id+" · "+new Date(i.created_at).toLocaleString()+"</small>",
-        '<button data-id="'+i.id+'" class="ok">Approve</button> <button data-id="'+i.id+'" class="red no">Reject</button>'
-      )
-    ).join("") : "<small>No pending deposits.</small>";
-
+      row("<b>"+i.telegram_id+"</b> · "+i.amount+" birr<br><small>Tx: "+i.tx_id+" · "+new Date(i.created_at).toLocaleString()+"</small>",
+        '<button data-id="'+i.id+'" class="ok">Approve</button> <button data-id="'+i.id+'" class="red no">Reject</button>')).join("")
+      : "<small>No pending deposits.</small>";
     const o = await api("/api/admin/orphans");
     $("orphans").innerHTML = o.items.length ? o.items.map(i=>
-      row(
-        "<b>"+i.amount+" birr</b> · Tx: "+i.tx_id+"<br><small>"+(i.note||"")+"</small>",
-        '<button data-id="'+i.id+'" class="ok">Credit user…</button>'
-      )
-    ).join("") : "<small>None.</small>";
-
+      row("<b>"+i.amount+" birr</b> · Tx: "+i.tx_id, '<small>'+(i.note||"")+'</small>')).join("")
+      : "<small>None.</small>";
     const w = await api("/api/admin/withdrawals");
     $("withdrawals").innerHTML = w.items.length ? w.items.map(i=>
-      row(
-        "<b>"+i.telegram_id+"</b> · "+i.amount+" birr → "+i.phone,
-        '<button data-id="'+i.id+'" class="blue paid">Mark paid</button> <button data-id="'+i.id+'" class="red wr">Reject</button>'
-      )
-    ).join("") : "<small>None.</small>";
-
+      row("<b>"+i.telegram_id+"</b> · "+i.amount+" birr → "+i.phone,
+        '<button data-id="'+i.id+'" class="blue paid">Mark paid</button> <button data-id="'+i.id+'" class="red wr">Reject</button>')).join("")
+      : "<small>None.</small>";
     $("pending").querySelectorAll("button.ok").forEach(b=>b.onclick=()=>approve(b.dataset.id));
     $("pending").querySelectorAll("button.no").forEach(b=>b.onclick=()=>rejectDep(b.dataset.id));
     $("withdrawals").querySelectorAll("button.paid").forEach(b=>b.onclick=()=>paidWd(b.dataset.id));
@@ -1314,65 +1178,44 @@ async function rejectWd(id){ try{ await api("/api/admin/withdraw-reject/"+id,"PO
 $("login").onclick = () => { pw = $("pw").value; $("whoami").textContent = "Password set"; load(); };
 </script></body></html>`;
 
-app.get("/admin", (req, res) => {
-  res.type("html").send(adminHtml);
-});
+app.get("/admin", (req, res) => res.type("html").send(adminHtml));
 
 function requireAdmin(req, res, next) {
   const pw = req.headers["x-admin-pw"];
-  if (!pw || pw !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!pw || pw !== ADMIN_PASSWORD) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
 app.get("/api/admin/pending", requireAdmin, async (req, res) => {
-  const r = await pool.query(
-    `SELECT id, telegram_id, amount, tx_id, created_at FROM transactions
-     WHERE type='deposit' AND status='pending' ORDER BY id ASC LIMIT 200`
-  );
+  const r = await pool.query(`SELECT id, telegram_id, amount, tx_id, created_at FROM transactions
+    WHERE type='deposit' AND status='pending' ORDER BY id ASC LIMIT 200`);
   res.json({ items: r.rows.map(x => ({ ...x, amount: Number(x.amount) })) });
 });
 
 app.get("/api/admin/orphans", requireAdmin, async (req, res) => {
-  const r = await pool.query(
-    `SELECT id, amount, tx_id, note, created_at FROM transactions
-     WHERE type='deposit_orphan' AND status='pending' ORDER BY id DESC LIMIT 200`
-  );
+  const r = await pool.query(`SELECT id, amount, tx_id, note, created_at FROM transactions
+    WHERE type='deposit_orphan' AND status='pending' ORDER BY id DESC LIMIT 200`);
   res.json({ items: r.rows.map(x => ({ ...x, amount: Number(x.amount) })) });
 });
 
 app.get("/api/admin/withdrawals", requireAdmin, async (req, res) => {
-  const r = await pool.query(
-    `SELECT id, telegram_id, amount, phone, created_at FROM transactions
-     WHERE type='withdraw' AND status='pending' ORDER BY id ASC LIMIT 200`
-  );
+  const r = await pool.query(`SELECT id, telegram_id, amount, phone, created_at FROM transactions
+    WHERE type='withdraw' AND status='pending' ORDER BY id ASC LIMIT 200`);
   res.json({ items: r.rows.map(x => ({ ...x, amount: Number(x.amount) })) });
 });
 
 app.post("/api/admin/approve/:id", requireAdmin, async (req, res) => {
   try {
-    const dep = await pool.query(
-      `SELECT id, telegram_id, amount, tx_id, status FROM transactions WHERE id=$1`,
-      [req.params.id]
-    );
+    const dep = await pool.query(`SELECT id, telegram_id, amount, status FROM transactions WHERE id=$1`, [req.params.id]);
     if (!dep.rows.length) return res.status(404).json({ error: "Not found" });
-    if (dep.rows[0].status !== "pending")
-      return res.status(400).json({ error: "Already handled" });
-
-    const { telegram_id, amount, tx_id } = dep.rows[0];
+    if (dep.rows[0].status !== "pending") return res.status(400).json({ error: "Already handled" });
+    const { telegram_id, amount } = dep.rows[0];
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(
-        `UPDATE users SET balance = balance + $1, updated_at=NOW() WHERE telegram_id=$2`,
-        [amount, telegram_id]
-      );
-      await client.query(
-        `UPDATE transactions SET status='approved', auto=FALSE, note='Manual admin approval' WHERE id=$1`,
-        [dep.rows[0].id]
-      );
+      await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, telegram_id]);
+      await client.query(`UPDATE transactions SET status='approved', auto=FALSE, note='Manual admin approval' WHERE id=$1`, [dep.rows[0].id]);
       await client.query("COMMIT");
     } catch (e) { await client.query("ROLLBACK"); throw e; }
     finally { client.release(); }
@@ -1384,137 +1227,55 @@ app.post("/api/admin/approve/:id", requireAdmin, async (req, res) => {
         ws.send(JSON.stringify({ type: "error", msg: `✅ Deposit ${amount} birr approved!` }));
       } catch {}
     await tgNotify(telegram_id, `✅ Deposit ${amount} birr approved. New balance: ${bal} birr`);
-
     res.json({ ok: true });
-  } catch (e) {
-    console.error("admin approve:", e);
-    res.status(500).json({ error: "Approve failed" });
-  }
+  } catch (e) { console.error("admin approve:", e); res.status(500).json({ error: "Approve failed" }); }
 });
 
 app.post("/api/admin/reject/:id", requireAdmin, async (req, res) => {
   try {
     const reason = String(req.body?.reason || "Rejected by admin");
-    const dep = await pool.query(
-      `SELECT telegram_id, amount FROM transactions WHERE id=$1 AND status='pending'`,
-      [req.params.id]
-    );
+    const dep = await pool.query(`SELECT telegram_id, amount FROM transactions WHERE id=$1 AND status='pending'`, [req.params.id]);
     if (!dep.rows.length) return res.status(400).json({ error: "Not pending" });
-
-    await pool.query(
-      `UPDATE transactions SET status='rejected', note=$1 WHERE id=$2`,
-      [reason, req.params.id]
-    );
-    await tgNotify(dep.rows[0].telegram_id,
-      `❌ Deposit ${dep.rows[0].amount} birr rejected: ${reason}`);
+    await pool.query(`UPDATE transactions SET status='rejected', note=$1 WHERE id=$2`, [reason, req.params.id]);
+    await tgNotify(dep.rows[0].telegram_id, `❌ Deposit ${dep.rows[0].amount} birr rejected: ${reason}`);
     res.json({ ok: true });
-  } catch (e) {
-    console.error("admin reject:", e);
-    res.status(500).json({ error: "Reject failed" });
-  }
+  } catch (e) { console.error("admin reject:", e); res.status(500).json({ error: "Reject failed" }); }
 });
 
 app.post("/api/admin/withdraw-paid/:id", requireAdmin, async (req, res) => {
   try {
-    const r = await pool.query(
-      `UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`,
-      [req.params.id]
-    );
+    const r = await pool.query(`UPDATE transactions SET status='paid' WHERE id=$1 AND type='withdraw' AND status='pending' RETURNING telegram_id, amount`, [req.params.id]);
     if (!r.rows.length) return res.status(400).json({ error: "Not pending" });
-    await tgNotify(r.rows[0].telegram_id,
-      `✅ Withdrawal ${r.rows[0].amount} birr has been paid to your Telebirr.`);
+    await tgNotify(r.rows[0].telegram_id, `✅ Withdrawal ${r.rows[0].amount} birr paid to your Telebirr.`);
     res.json({ ok: true });
-  } catch (e) {
-    console.error("withdraw paid:", e);
-    res.status(500).json({ error: "Failed" });
-  }
+  } catch (e) { console.error("withdraw paid:", e); res.status(500).json({ error: "Failed" }); }
 });
 
 app.post("/api/admin/withdraw-reject/:id", requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const r = await client.query(
-      `SELECT telegram_id, amount FROM transactions WHERE id=$1 AND type='withdraw' AND status='pending' FOR UPDATE`,
-      [req.params.id]
-    );
+    const r = await client.query(`SELECT telegram_id, amount FROM transactions WHERE id=$1 AND type='withdraw' AND status='pending' FOR UPDATE`, [req.params.id]);
     if (!r.rows.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Not pending" }); }
     const { telegram_id, amount } = r.rows[0];
-
-    // Refund
-    await client.query(`UPDATE users SET balance = balance + $1 WHERE telegram_id=$2`, [amount, telegram_id]);
+    await client.query(`UPDATE users SET balance=balance+$1 WHERE telegram_id=$2`, [amount, telegram_id]);
     await client.query(`UPDATE transactions SET status='rejected' WHERE id=$1`, [req.params.id]);
     await client.query("COMMIT");
-
-    await tgNotify(telegram_id, `❌ Withdrawal ${amount} birr was rejected. Funds returned to your balance.`);
+    await tgNotify(telegram_id, `❌ Withdrawal ${amount} birr rejected. Funds returned.`);
     res.json({ ok: true });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("withdraw reject:", e);
     res.status(500).json({ error: "Failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// Credit an orphan receipt to a specific user (admin-only)
-app.post("/api/admin/credit-orphan/:id", requireAdmin, async (req, res) => {
-  try {
-    const targetUser = String(req.body?.telegram_id || "").trim();
-    if (!targetUser) return res.status(400).json({ error: "telegram_id required" });
-
-    const o = await pool.query(
-      `SELECT id, amount, tx_id FROM transactions WHERE id=$1 AND type='deposit_orphan' AND status='pending'`,
-      [req.params.id]
-    );
-    if (!o.rows.length) return res.status(400).json({ error: "Orphan not found" });
-
-    const amount = Number(o.rows[0].amount);
-    const txId = o.rows[0].tx_id;
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query(
-        `UPDATE users SET balance = balance + $1 WHERE telegram_id=$2`,
-        [amount, targetUser]
-      );
-      await client.query(
-        `UPDATE transactions SET type='deposit', telegram_id=$1, status='approved', auto=FALSE, note='Orphan credited by admin' WHERE id=$2`,
-        [targetUser, o.rows[0].id]
-      );
-      await client.query("COMMIT");
-    } catch (e) { await client.query("ROLLBACK"); throw e; }
-    finally { client.release(); }
-
-    const bal = await getBalance(targetUser);
-    for (const ws of wss.clients) if (String(ws.tgId) === String(targetUser) && ws.readyState === 1)
-      try { ws.send(JSON.stringify({ type: "balance", balance: bal })); } catch {}
-    await tgNotify(targetUser, `✅ Deposit ${amount} birr credited. New balance: ${bal} birr`);
-
-    console.log(`🩹 Orphan ${txId} credited to ${targetUser}: ${amount} birr`);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("credit orphan:", e);
-    res.status(500).json({ error: "Failed" });
-  }
+  } finally { client.release(); }
 });
 
 // ============================================================
-// HEALTH + FALLBACK
+// FALLBACK
 // ============================================================
-
-app.get("/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true, db: "connected", botToken: !!BOT_TOKEN, game: game.phase, bots: BOT_COUNT });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
 app.use((req, res, next) => {
-  if (req.path.startsWith("/api") || req.path.startsWith("/ws") || req.path.startsWith("/webhook") || req.path === "/admin") return next();
+  if (req.path.startsWith("/api") || req.path.startsWith("/ws") || req.path.startsWith("/webhook") || req.path === "/admin" || req.path === "/health") return next();
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
@@ -1534,7 +1295,9 @@ server.listen(PORT, "0.0.0.0", async () => {
     await initDatabase();
     console.log("✅ Database ready");
     await seedBots();
+    startupReady = true;
     startLobby();
+    console.log("🎮 Game loop started");
   } catch (err) {
     console.error("❌ Startup error:", err);
   }
