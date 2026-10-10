@@ -94,7 +94,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
     <div class="winner-title">BINGO WINNER!</div>
     <div class="winner-name" id="winnerPopName"></div>
     <div class="winner-card" id="winnerPopCard"></div>
-    <div class="winner-prize" id="winnerPopPrize"></div>
+    <div class="winner-prize" id="winnerPopPrize"></div><div id="winnerDetails"></div>
   </div>
 </div>
 <div class="top">
@@ -163,6 +163,7 @@ function connect() {
     const m = JSON.parse(e.data);
     if (m.type === "balance") $("bal").textContent = m.balance;
     if (m.type === "error") flash(m.msg);
+    if (m.type === "winner_popup") showGlobalWinnerPopup(m);
     if (m.type === "state") { S = m; render(); }
   };
 }
@@ -189,6 +190,30 @@ function showWinnerPopup(w) {
   clearTimeout(winnerTimer);
   winnerTimer = setTimeout(() => { $("winnerPop").hidden = true; }, 3000);
 }
+function showGlobalWinnerPopup(m) {
+  const winners = Array.isArray(m.winners) ? m.winners : [];
+  $("winnerPopName").textContent = winners.length
+    ? winners.map(w => `${(w.names || ["Winner"]).join(", ")}${w.isBot ? " (Bot)" : ""}`).join(" · ")
+    : "No winner this round";
+  $("winnerPopCard").textContent = winners.length
+    ? winners.map(w => `Card #${w.cardNo} — ${w.pattern || "Bingo"}`).join(" | ")
+    : "No card completed a pattern";
+  $("winnerPopPrize").textContent = winners.length
+    ? `Pool ${m.prize || 0} birr · ${winners.length} winner${winners.length === 1 ? "" : "s"}`
+    : "0 birr";
+  $("winnerDetails").innerHTML = winners.map(w => {
+    const card = w.card || [];
+    const nums = card.flat().map(n => `<span style="display:grid;place-items:center;aspect-ratio:1;border-radius:5px;background:${n === 0 ? "var(--N)" : (m.drawn || []).includes(n) ? "var(--G)" : "#fff"};color:#111;font-size:12px;font-weight:800">${n || "★"}</span>`).join("");
+    return `<div style="margin-top:12px;text-align:left;background:var(--bg);border-radius:12px;padding:10px">
+      <b>${(w.names || ["Winner"]).join(", ")} — Card #${w.cardNo}</b>
+      <div style="font-size:13px;color:var(--N);margin:3px 0">${w.pattern || "Bingo"} · wins ${w.prize} birr</div>
+      <div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px;max-width:260px;margin:auto">${nums}</div>
+    </div>`;
+  }).join("");
+  $("winnerPop").hidden = false;
+  clearTimeout(winnerTimer);
+  winnerTimer = setTimeout(() => { $("winnerPop").hidden = true; }, Number(m.duration || 3000));
+}
 
 function render() {
   const s = S, d = s.drawn, last = d[d.length - 1], ball = $("ball");
@@ -204,7 +229,7 @@ function render() {
   else { st.textContent = "Round over"; sub.textContent = "Next round starts soon"; }
   $("win").hidden = !s.winner;
   if (s.winner) {
-    $("win").textContent = s.winner.you ? `You won ${s.winner.prize} birr 🎉` : `${s.winner.names.join(", ")} won ${s.winner.prize} birr`;
+    $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
     const winnerKey = JSON.stringify({
       names: s.winner.names || [],
       you: !!s.winner.you,
@@ -213,7 +238,6 @@ function render() {
     });
     if (winnerKey !== lastWinnerKey) {
       lastWinnerKey = winnerKey;
-      showWinnerPopup(s.winner);
     }
   } else {
     lastWinnerKey = "";
@@ -228,9 +252,9 @@ function render() {
     return `<div class="card${w ? " win" : ""}"><p class="cn">Card #${c.no}${w ? " · BINGO!" : ""}</p><div class="grid">${heads()}${cells(c.card, d)}</div></div>`; }).join("");
 }
 function drawPicker() {
-  const t = new Set(S.taken), room = S.max - S.cards.length;
+  const t = new Set([...(S.taken || []), ...(S.cards || []).map(c => c.no)]), room = S.max - S.cards.length;
   sel = sel.filter((n) => !t.has(n)).slice(0, room);
-  const key = S.taken.join() + "|" + sel.join(); if (key === pk) return; pk = key;
+  const key = [...t].join() + "|" + sel.join(); if (key === pk) return; pk = key;
   const box = $("nums"), top = box.scrollTop; box.innerHTML = "";
   for (let n = 1; n <= TOTAL; n++) {
     const b = document.createElement("button"); b.textContent = n;
@@ -247,7 +271,7 @@ function drawPicker() {
 // ==END UI==
 $("jump").oninput = () => {
   const n = parseInt($("jump").value), room = S.max - S.cards.length;
-  if (n >= 1 && n <= TOTAL && !S.taken.includes(n) && !sel.includes(n) && sel.length < room) sel.push(n);
+  if (n >= 1 && n <= TOTAL && !(S.cards || []).some(c => c.no === n) && !sel.includes(n) && sel.length < room) sel.push(n);
   if (n >= 1 && n <= TOTAL) { pk = ""; drawPicker(); $("nums").children[n - 1].scrollIntoView({ block: "center" }); }
 };
 $("join").onclick = () => ws.send(JSON.stringify({ type: "join", cards: sel }));
