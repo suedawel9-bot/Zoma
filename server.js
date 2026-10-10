@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-10 — stable startup, instant /health, bulk bot seed
+// Updated: 2026-10-10 — Telegram bot + strict tx matching
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-10");
@@ -13,6 +13,7 @@ import { fileURLToPath } from "url";
 import { Pool } from "pg";
 import { WebSocketServer } from "ws";
 import rateLimit from "express-rate-limit";
+import { Bot, InlineKeyboard } from "grammy";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -132,10 +133,7 @@ function extractInitData(req) {
 // ============================================================
 
 async function tgNotify(chatId, text) {
-  if (!ADMIN_BOT_TOKEN || !chatId) {
-    console.warn("tgNotify skipped: no token or chatId");
-    return;
-  }
+  if (!ADMIN_BOT_TOKEN || !chatId) return;
   try {
     const res = await fetch(`https://api.telegram.org/bot${ADMIN_BOT_TOKEN}/sendMessage`, {
       method: "POST",
@@ -156,7 +154,7 @@ async function tgNotify(chatId, text) {
 }
 
 // ============================================================
-// ENSURE USER
+// ENSURE USER + AUTH MIDDLEWARE
 // ============================================================
 
 async function ensureUser(tgUser) {
@@ -217,9 +215,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
-// HEALTH CHECK — INSTANT, NO DB, MUST BE FIRST
-// Railway pings this every few seconds. If it's slow, it kills
-// the container. Never query Postgres here.
+// HEALTH CHECK — instant, no DB, must be first
 // ============================================================
 
 let startupReady = false;
@@ -233,10 +229,6 @@ app.get("/health", (req, res) => {
     bots: BOT_COUNT
   });
 });
-
-// ============================================================
-// RATE LIMIT
-// ============================================================
 
 const apiLimiter = rateLimit({
   windowMs: 1000,
@@ -353,13 +345,12 @@ async function initDatabase() {
 }
 
 // ============================================================
-// BOT SEEDING — BULK INSERT, ONE QUERY
+// BOT SEEDING — bulk insert
 // ============================================================
 
 const BOT_ID_BASE = 9000000000000;
 
 async function seedBots() {
-  // Skip if already seeded
   const existing = await pool.query(
     `SELECT COUNT(*)::int AS n FROM users WHERE is_bot = TRUE`
   );
@@ -538,7 +529,6 @@ function startCountdown() {
 
 async function addBots() {
   game.bots = [];
-  // Track taken numbers locally so we don't hit the DB
   const taken = new Set([...game.cards.values()].map(e => e.cardNo));
   const updates = [];
 
@@ -559,15 +549,9 @@ async function addBots() {
     }
     game.bots.push({ id: i, tgId: botTgId, names: [botName], cards: botCards });
 
-    if (botCards.length) {
-      updates.push([botCards.length * CARD_PRICE, botTgId]);
-    }
+    if (botCards.length) updates.push([botCards.length * CARD_PRICE, botTgId]);
   }
 
-  // Do NOT call sendState() inside the loop — one final sendState() happens
-  // at the end of startLobby(). This removes 100+ wasted broadcasts.
-
-  // Bulk update bot balances in one query
   if (updates.length) {
     try {
       const values = [];
@@ -717,7 +701,7 @@ async function getBalance(tgId) {
 }
 
 // ============================================================
-// DEPOSIT VERIFY
+// DEPOSIT — RECEIPT VERIFY
 // ============================================================
 
 async function verifyTelebirrReceipt(txId) {
@@ -752,74 +736,319 @@ async function verifyTelebirrReceipt(txId) {
   }
 }
 
-async function creditDeposit({ txId, amount, source = "auto", note = null }) {
-  const dupe = await pool.query(`SELECT id, status FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
-  if (dupe.rows.length && dupe.rows[0].status === "approved") {
-    return { status: "duplicate", message: "Already approved" };
-  }
+// ============================================================
+// DEPOSIT — NOTIFY + CREDIT + CLAIM (strict tx_id matching)
+// ============================================================
 
-  let pending = await pool.query(
-    `SELECT id, telegram_id, amount FROM transactions
-     WHERE tx_id=$1 AND type='deposit' AND status='pending' LIMIT 1`,
-    [txId]
-  );
-  if (!pending.rows.length) {
-    pending = await pool.query(
-      `SELECT id, telegram_id, amount FROM transactions
-       WHERE type='deposit' AND status='pending' AND amount=$1
-         AND created_at > NOW() - INTERVAL '30 minutes'
-       ORDER BY created_at ASC LIMIT 1`,
-      [amount]
-    );
-  }
-
-  if (!pending.rows.length) {
-    await pool.query(
-      `INSERT INTO transactions (telegram_id, type, amount, status, tx_id, note, auto)
-       VALUES (0, 'deposit_orphan', $1, 'pending', $2, $3, $4)`,
-      [amount, txId, note || `Unmatched ${source} receipt`, source === "auto"]
-    );
-    if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
-      `⚠️ <b>Orphan ${source} receipt</b>\nAmount: ${amount} birr\nTxID: ${txId}`);
-    return { status: "orphan" };
-  }
-
-  const dep = pending.rows[0];
-  if (Number(dep.amount) !== Number(amount)) {
-    await pool.query(`UPDATE transactions SET note=$1 WHERE id=$2`,
-      [`Amount mismatch: claimed ${dep.amount}, got ${amount}`, dep.id]);
-    return { status: "mismatch" };
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`,
-      [amount, dep.telegram_id]);
-    await client.query(`UPDATE transactions SET status='approved', tx_id=$1, auto=$2, note=$3 WHERE id=$4`,
-      [txId, source === "auto", note, dep.id]);
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    console.error("credit deposit:", e);
-    return { status: "error" };
-  } finally { client.release(); }
-
-  const newBal = await getBalance(dep.telegram_id);
+async function notifyCredited(telegramId, amount, txId, source) {
+  const newBal = await getBalance(telegramId);
   for (const ws of wss.clients) {
-    if (String(ws.tgId) === String(dep.telegram_id) && ws.readyState === 1) {
+    if (String(ws.tgId) === String(telegramId) && ws.readyState === 1) {
       try {
         ws.send(JSON.stringify({ type: "balance", balance: newBal }));
         ws.send(JSON.stringify({ type: "error", msg: `✅ Deposit ${amount} birr approved!` }));
       } catch {}
     }
   }
-  await tgNotify(dep.telegram_id, `✅ Deposit approved: ${amount} birr. New balance: ${newBal} birr`);
+  await tgNotify(telegramId, `✅ Deposit approved: ${amount} birr. New balance: ${newBal} birr`);
   if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
-    `✅ <b>Deposit approved (${source})</b>\nUser: ${dep.telegram_id}\nAmount: ${amount} birr\nTxID: ${txId}`);
+    `✅ <b>Deposit approved (${source})</b>\nUser: ${telegramId}\nAmount: ${amount} birr\nTxID: ${txId}`);
+  console.log(`💰 Deposit ${amount} birr approved for ${telegramId} (${source}) TxID=${txId}`);
+  return newBal;
+}
 
-  console.log(`💰 Deposit ${amount} birr approved for ${dep.telegram_id} (${source}) TxID=${txId}`);
-  return { status: "approved", balance: newBal };
+async function creditDeposit({ txId, amount, source = "auto", note = null }) {
+  const client = await pool.connect();
+  let dep;
+  try {
+    await client.query("BEGIN");
+
+    const r = await client.query(
+      `SELECT id, telegram_id, type, amount, status
+         FROM transactions WHERE tx_id=$1 FOR UPDATE`,
+      [txId]
+    );
+
+    if (!r.rows.length) {
+      await client.query(
+        `INSERT INTO transactions (telegram_id, type, amount, status, tx_id, note, auto)
+         VALUES (0, 'deposit_orphan', $1, 'pending', $2, $3, $4)
+         ON CONFLICT DO NOTHING`,
+        [amount, txId, note || `Unmatched ${source} receipt`, source === "auto"]
+      );
+      await client.query("COMMIT");
+      if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
+        `⚠️ <b>Receipt waiting for its user</b>\nAmount: ${amount} birr\nTxID: ${txId}`);
+      return { status: "orphan" };
+    }
+
+    dep = r.rows[0];
+
+    if (dep.status === "approved") {
+      await client.query("ROLLBACK");
+      return { status: "duplicate", message: "Already approved" };
+    }
+    if (dep.type !== "deposit" || dep.status !== "pending") {
+      await client.query("ROLLBACK");
+      return { status: "orphan" };
+    }
+    if (Number(dep.amount) !== Number(amount)) {
+      await client.query(`UPDATE transactions SET note=$1 WHERE id=$2`,
+        [`Amount mismatch: claimed ${dep.amount}, receipt ${amount}`, dep.id]);
+      await client.query("COMMIT");
+      if (ADMIN_TG_ID) await tgNotify(ADMIN_TG_ID,
+        `⚠️ <b>Amount mismatch</b>\nUser: ${dep.telegram_id}\nClaimed: ${dep.amount}\nReceipt: ${amount}\nTxID: ${txId}`);
+      return { status: "mismatch" };
+    }
+
+    await client.query(
+      `UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`,
+      [amount, dep.telegram_id]);
+    await client.query(
+      `UPDATE transactions SET status='approved', auto=$1, note=$2 WHERE id=$3`,
+      [source === "auto", note, dep.id]);
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("credit deposit:", e);
+    return { status: "error" };
+  } finally {
+    client.release();
+  }
+
+  const balance = await notifyCredited(dep.telegram_id, amount, txId, source);
+  return { status: "approved", balance };
+}
+
+async function claimOrphan({ txId, userId, amount }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const r = await client.query(
+      `SELECT id, amount FROM transactions
+        WHERE tx_id=$1 AND type='deposit_orphan' AND status='pending' FOR UPDATE`,
+      [txId]
+    );
+    if (!r.rows.length) { await client.query("ROLLBACK"); return { status: "none" }; }
+
+    if (Number(r.rows[0].amount) !== Number(amount)) {
+      await client.query("ROLLBACK");
+      return { status: "mismatch" };
+    }
+
+    await client.query(
+      `UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`,
+      [amount, userId]);
+    await client.query(
+      `UPDATE transactions
+          SET telegram_id=$1, type='deposit', status='approved', auto=TRUE,
+              note='Receipt matched by tx ID'
+        WHERE id=$2`,
+      [userId, r.rows[0].id]);
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("claim orphan:", e);
+    return { status: "error" };
+  } finally {
+    client.release();
+  }
+
+  const balance = await notifyCredited(userId, amount, txId, "matched");
+  return { status: "approved", balance };
+}
+
+// ============================================================
+// TELEGRAM BOT (grammy)
+// ============================================================
+
+let bot = null;
+
+if (ADMIN_BOT_TOKEN) {
+  bot = new Bot(ADMIN_BOT_TOKEN);
+
+  bot.command("start", async (ctx) => {
+    await ctx.reply(
+      `🎱 <b>Zoma Bingo Bot</b>\n\n` +
+      `Commands:\n` +
+      `/check DJ53G7TAZ1 — Verify a Telebirr payment\n` +
+      `/balance — Show your current balance\n` +
+      `/help — This message\n\n` +
+      `Open the Mini App to play Bingo.`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.command("help", (ctx) => ctx.reply(
+    "Commands:\n" +
+    "/check <txId> — Verify a Telebirr transaction\n" +
+    "/balance — Show balance"
+  ));
+
+  bot.command("balance", async (ctx) => {
+    try {
+      const bal = await getBalance(ctx.from.id);
+      await ctx.reply(`💰 Balance: <b>${bal} birr</b>`, { parse_mode: "HTML" });
+    } catch (e) {
+      await ctx.reply("Could not load balance.");
+    }
+  });
+
+  bot.command("check", async (ctx) => {
+    const args = (ctx.match || "").trim().split(/\s+/).filter(Boolean);
+    const txId = (args[0] || "").toUpperCase();
+
+    if (!/^DJ[A-Z0-9]{8,}$/.test(txId)) {
+      return ctx.reply("Usage: /check DJ53G7TAZ1");
+    }
+
+    const tgId = ctx.from.id;
+    const existing = await pool.query(
+      `SELECT type, status, amount, telegram_id FROM transactions WHERE tx_id=$1 LIMIT 1`,
+      [txId]
+    );
+
+    if (existing.rows.length && existing.rows[0].status === "approved") {
+      return ctx.reply(`✅ Already approved.\nAmount: ${existing.rows[0].amount} birr`);
+    }
+
+    if (existing.rows.length && existing.rows[0].type === "deposit_orphan") {
+      const amount = Number(existing.rows[0].amount);
+      const r = await claimOrphan({ txId, userId: tgId, amount });
+      if (r.status === "approved") {
+        return ctx.reply(`✅ Deposit matched & credited!\n${amount} birr added.\nBalance: ${r.balance} birr`);
+      }
+      if (r.status === "mismatch") return ctx.reply(`❌ Amount mismatch. Contact support.`);
+      return ctx.reply(`❌ Could not claim. (${r.status})`);
+    }
+
+    const v = await verifyTelebirrReceipt(txId);
+    if (!v.ok) {
+      return ctx.reply(
+        `❌ Could not verify <b>${txId}</b>\nReason: ${v.reason}\n\n` +
+        `If you already paid, open the Mini App → Profile → Deposit and enter the TxID there.`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const dep = await pool.query(
+      `SELECT id, amount FROM transactions
+       WHERE telegram_id=$1 AND type='deposit' AND status='pending' LIMIT 1`,
+      [tgId]
+    );
+
+    if (!dep.rows.length) {
+      await pool.query(
+        `INSERT INTO transactions (telegram_id, type, amount, status, tx_id, note, auto)
+         VALUES (0, 'deposit_orphan', $1, 'pending', $2, $3, TRUE)
+         ON CONFLICT (tx_id) DO NOTHING`,
+        [v.amount, txId, "Verified via /check by user " + tgId]
+      );
+      return ctx.reply(
+        `✅ Receipt verified: <b>${v.amount} birr</b>\n\n` +
+        `Now open the Mini App → Profile → Deposit and enter the same TxID: <code>${txId}</code>`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    if (Number(dep.rows[0].amount) !== v.amount) {
+      return ctx.reply(
+        `❌ Amount mismatch.\nYour claim: ${dep.rows[0].amount} birr\nReceipt: ${v.amount} birr`
+      );
+    }
+
+    const r = await creditDeposit({ txId, amount: v.amount, source: "auto", note: "Verified via /check" });
+    if (r.status === "approved") {
+      return ctx.reply(`✅ Deposit approved!\n${v.amount} birr added.\nBalance: ${r.balance} birr`);
+    }
+    return ctx.reply(`❌ ${r.status}`);
+  });
+
+  // ---- Admin commands ----
+  const isAdmin = (ctx) =>
+    String(ctx.from.id) === String(ADMIN_TG_ID) ||
+    String(ctx.chat.id) === String(ADMIN_TG_ID);
+
+  bot.command("pending", async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    const r = await pool.query(
+      `SELECT id, telegram_id, amount, tx_id FROM transactions
+       WHERE type='deposit' AND status='pending' ORDER BY id ASC LIMIT 20`
+    );
+    if (!r.rows.length) return ctx.reply("No pending deposits.");
+
+    const lines = r.rows.map(x =>
+      `<b>#${x.id}</b> · ${x.amount} birr · user ${x.telegram_id}\nTx: <code>${x.tx_id}</code>`
+    ).join("\n\n");
+
+    const kb = new InlineKeyboard();
+    for (const x of r.rows.slice(0, 8)) {
+      kb.text(`✅ #${x.id}`, `approve:${x.id}`).text(`❌ #${x.id}`, `reject:${x.id}`).row();
+    }
+    await ctx.reply(lines, { parse_mode: "HTML", reply_markup: kb });
+  });
+
+  bot.command(/^approve_(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    await approveById(Number(ctx.match[1]));
+    await ctx.reply(`✅ Approved #${ctx.match[1]}`);
+  });
+
+  bot.command(/^reject_(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    const id = Number(ctx.match[1]);
+    await pool.query(
+      `UPDATE transactions SET status='rejected', note='Rejected via bot' WHERE id=$1 AND status='pending'`,
+      [id]
+    );
+    await ctx.reply(`❌ Rejected #${id}`);
+  });
+
+  bot.callbackQuery(/^approve:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
+    await approveById(Number(ctx.match[1]));
+    await ctx.answerCallbackQuery("Approved");
+    try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+  });
+
+  bot.callbackQuery(/^reject:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCallbackQuery("Not allowed");
+    const id = Number(ctx.match[1]);
+    await pool.query(
+      `UPDATE transactions SET status='rejected', note='Rejected via bot' WHERE id=$1 AND status='pending'`,
+      [id]
+    );
+    await ctx.answerCallbackQuery("Rejected");
+    try { await ctx.editMessageReplyMarkup({ reply_markup: undefined }); } catch {}
+  });
+
+  bot.catch((err) => console.error("bot error:", err));
+
+  console.log(`🤖 Telegram bot initialized (polling)`);
+} else {
+  console.warn("⚠️ ADMIN_BOT_TOKEN not set — Telegram bot disabled");
+}
+
+async function approveById(id) {
+  const dep = await pool.query(
+    `SELECT id, telegram_id, amount, status FROM transactions WHERE id=$1`,
+    [id]
+  );
+  if (!dep.rows.length || dep.rows[0].status !== "pending") return;
+
+  const { telegram_id, amount } = dep.rows[0];
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`, [amount, telegram_id]);
+    await client.query(`UPDATE transactions SET status='approved', auto=FALSE, note='Approved via bot' WHERE id=$1`, [id]);
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally { client.release(); }
+
+  await notifyCredited(telegram_id, amount, "MANUAL", "admin-bot");
 }
 
 // ============================================================
@@ -929,7 +1158,6 @@ wss.on("connection", (ws) => {
   ws.on("error", () => {});
 });
 
-// Heartbeat — terminate dead sockets
 setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.isAlive === false) { try { ws.terminate(); } catch {} continue; }
@@ -971,7 +1199,7 @@ app.get("/api/history", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// DEPOSIT
+// DEPOSIT — endpoint
 // ============================================================
 
 app.post("/api/deposit", authMiddleware, async (req, res) => {
@@ -985,19 +1213,45 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "Invalid transaction ID (should look like DJ53G7TAZ1)" });
   }
 
+  const tryClaim = async () => {
+    const c = await claimOrphan({ txId, userId: req.tgUser.id, amount });
+    if (c.status === "approved") return res.json({ status: "approved", amount, balance: c.balance });
+    if (c.status === "mismatch") {
+      return res.status(400).json({ error: "Amount doesn't match the payment received. Contact support." });
+    }
+    return null;
+  };
+
   try {
-    const dupe = await pool.query(`SELECT id, status FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
-    if (dupe.rows.length) {
-      if (dupe.rows[0].status === "approved") return res.status(400).json({ error: "Already approved" });
+    const existing = await pool.query(
+      `SELECT type, status FROM transactions WHERE tx_id=$1 LIMIT 1`, [txId]);
+
+    if (existing.rows.length) {
+      const e = existing.rows[0];
+      if (e.type === "deposit_orphan" && e.status === "pending") {
+        const handled = await tryClaim();
+        if (handled) return handled;
+      }
+      if (e.status === "approved") return res.status(400).json({ error: "Already approved" });
       return res.status(400).json({ error: "Already being processed" });
     }
 
-    const ins = await pool.query(
-      `INSERT INTO transactions (telegram_id, type, amount, status, tx_id)
-       VALUES ($1, 'deposit', $2, 'pending', $3) RETURNING id`,
-      [req.tgUser.id, amount, txId]
-    );
-    const depId = ins.rows[0].id;
+    let depId;
+    try {
+      const ins = await pool.query(
+        `INSERT INTO transactions (telegram_id, type, amount, status, tx_id)
+         VALUES ($1, 'deposit', $2, 'pending', $3) RETURNING id`,
+        [req.tgUser.id, amount, txId]
+      );
+      depId = ins.rows[0].id;
+    } catch (e) {
+      if (e.code === "23505") {
+        const handled = await tryClaim();
+        if (handled) return handled;
+        return res.status(400).json({ error: "Already being processed" });
+      }
+      throw e;
+    }
 
     const v = await verifyTelebirrReceipt(txId);
     if (v.ok && Number(v.amount) === amount) {
@@ -1010,7 +1264,10 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
       `Auto: ${v.ok ? "matched but not credited" : v.reason}`);
 
     res.json({ status: "pending", depId });
-  } catch (err) { console.error("deposit:", err); res.status(500).json({ error: "Deposit failed" }); }
+  } catch (err) {
+    console.error("deposit:", err);
+    res.status(500).json({ error: "Deposit failed" });
+  }
 });
 
 // ============================================================
@@ -1113,7 +1370,7 @@ app.post("/webhook/sms", async (req, res) => {
 });
 
 // ============================================================
-// ADMIN
+// ADMIN PANEL
 // ============================================================
 
 const adminHtml = `<!doctype html>
@@ -1296,6 +1553,18 @@ server.listen(PORT, "0.0.0.0", async () => {
     console.log("✅ Database ready");
     await seedBots();
     startupReady = true;
+
+    // Start Telegram bot AFTER DB is ready
+    if (bot) {
+      try {
+        bot.start({
+          onStart: (info) => console.log(`🤖 Bot @${info.username} polling started`)
+        });
+      } catch (e) {
+        console.error("bot start:", e.message);
+      }
+    }
+
     startLobby();
     console.log("🎮 Game loop started");
   } catch (err) {
@@ -1306,6 +1575,7 @@ server.listen(PORT, "0.0.0.0", async () => {
 async function shutdown(sig) {
   console.log(`🛑 ${sig}`);
   clearTimers();
+  if (bot) { try { await bot.stop(); } catch {} }
   for (const ws of wss.clients) { try { ws.close(); } catch {} }
   try { await pool.end(); } catch {}
   server.close(() => process.exit(0));
