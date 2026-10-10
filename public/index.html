@@ -101,7 +101,6 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 </div>
 <div class="top">
   <div class="bal"><small>Balance</small><span id="bal">–</span> birr</div>
-  
 </div>
 
 <main id="pgPlay">
@@ -127,8 +126,8 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
   <section class="pcard"><h3>Deposit with Telebirr</h3>
     <div class="acct">Send money to<br><b id="tbNum"></b><br><span class="mute" id="tbName"></span></div>
     <label for="dAmt">Amount you sent (birr)</label><input id="dAmt" type="number" inputmode="numeric" min="10">
-    <label for="dTx">Transaction ID from the Telebirr SMS</label><input id="dTx" maxlength="10" autocapitalize="characters" placeholder="DJ57GEEQTD">
-    <p class="msg" id="dMsg"></p><button class="cta" id="dSend" style="margin-top:0">Send for approval</button></section>
+    <label for="dTx">Transaction ID from the Telebirr SMS</label><input id="dTx" maxlength="14" autocapitalize="characters" placeholder="DJ53G7TAZ1">
+    <p class="msg" id="dMsg"></p><button class="cta" id="dSend" style="margin-top:0">Deposit</button></section>
   <section class="pcard"><h3>Withdraw to Telebirr</h3>
     <label for="wAmt">Amount (birr)</label><input id="wAmt" type="number" inputmode="numeric">
     <label for="wPh">Telebirr phone number</label><input id="wPh" type="tel" placeholder="09XXXXXXXX">
@@ -179,18 +178,6 @@ const line = (c, d) => {
 };
 const heads = () => COL.map((l, i) => `<div class="h" style="background:var(${CC[i]})">${l}</div>`).join("");
 const cells = (card, d) => card.flat().map((n) => `<div class="c ${n === 0 ? "free" : d && d.includes(n) ? "mk" : ""}">${n || "FREE"}</div>`).join("");
-function showWinnerPopup(w) {
-  if (!w) return;
-  const names = Array.isArray(w.names) ? w.names : [];
-  const name = w.you ? "You" : (names.length ? names.join(", ") : "Winner");
-  const cardNo = w.card ?? w.cardNo ?? w.no ?? "";
-  $("winnerPopName").textContent = name;
-  $("winnerPopCard").textContent = cardNo ? `Card #${cardNo}` : "";
-  $("winnerPopPrize").textContent = `${w.prize ?? 0} birr`;
-  $("winnerPop").hidden = false;
-  clearTimeout(winnerTimer);
-  winnerTimer = setTimeout(() => { $("winnerPop").hidden = true; }, 3000);
-}
 function showGlobalWinnerPopup(m) {
   const winners = Array.isArray(m.winners) ? m.winners : [];
   $("winnerPopName").textContent = winners.length
@@ -231,17 +218,6 @@ function render() {
   $("win").hidden = !s.winner;
   if (s.winner) {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
-    const winnerKey = JSON.stringify({
-      names: s.winner.names || [],
-      you: !!s.winner.you,
-      prize: s.winner.prize,
-      card: s.winner.card ?? s.winner.cardNo ?? s.winner.no
-    });
-    if (winnerKey !== lastWinnerKey) {
-      lastWinnerKey = winnerKey;
-    }
-  } else {
-    lastWinnerKey = "";
   }
   const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
   $("pick").hidden = !canBuy; if (canBuy) drawPicker();
@@ -302,10 +278,15 @@ async function loadHist() {
   } catch {}
 }
 $("dSend").onclick = async () => {
-  $("dMsg").textContent = "Sending…";
+  $("dMsg").textContent = "Verifying…";
   try {
-    await api("/api/deposit", { amount: $("dAmt").value, txId: $("dTx").value });
-    $("dMsg").textContent = "Sent. You'll get a message when it's approved.";
+    const r = await api("/api/deposit", { amount: $("dAmt").value, txId: $("dTx").value });
+    if (r.status === "approved") {
+      $("bal").textContent = r.balance;
+      $("dMsg").textContent = `✅ Auto-approved! ${r.amount} birr added.`;
+    } else {
+      $("dMsg").textContent = "⏳ Submitted. You'll get a message when approved.";
+    }
     $("dAmt").value = $("dTx").value = ""; loadHist();
   } catch (e) { $("dMsg").textContent = e.message; }
 };
