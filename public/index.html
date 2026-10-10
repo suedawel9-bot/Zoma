@@ -75,6 +75,8 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 .nums{display:grid;grid-template-columns:repeat(auto-fill,minmax(40px,1fr));gap:5px;margin:10px 0}
 .nums button{padding:7px 0;background:var(--panel);font-size:14px;border-radius:10px}
 .nums button:disabled{opacity:.25}.nums button.sel{background:var(--N);color:#111}
+.nums button.taken:disabled{opacity:1;background:#5b2638;color:#ffc1c8;border:1px solid #c65a70;text-decoration:line-through;position:relative;cursor:not-allowed}
+.nums button.taken:disabled::after{content:"×";position:absolute;top:-5px;right:-3px;width:15px;height:15px;border-radius:50%;display:grid;place-items:center;background:#e8455b;color:#fff;font-size:12px;line-height:1;font-weight:800;text-decoration:none}
 .prev{margin-top:8px}.prev .c{font-size:18px;display:grid;place-items:center}
 .c{display:grid;place-items:center}.cn{margin:0 0 6px;font-weight:800;color:#555}.card.win{box-shadow:0 0 0 4px var(--G)}
 .prev .card{margin-bottom:10px}
@@ -112,7 +114,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 
 <div id="play" hidden><div id="cards"></div></div>
 <div id="pick" hidden>
-  <p class="mute">Choose up to 4 cards (1 to 500). Selected cards are shown below the list. Grey cards are taken, including the bots\u2019 cards. Bingo is called automatically.</p>
+  <p class="mute">Choose up to 4 cards (1 to 500). Red crossed-out numbers are already taken by a player or bot and cannot be selected. Bingo is called automatically.</p>
   <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
   <div class="nums" id="nums"></div>
   <div class="prev" id="prev"></div>
@@ -258,7 +260,7 @@ function drawPicker() {
   const box = $("nums"), top = box.scrollTop; box.innerHTML = "";
   for (let n = 1; n <= TOTAL; n++) {
     const b = document.createElement("button"); b.textContent = n;
-    if (t.has(n)) b.disabled = true;
+    if (t.has(n)) { b.disabled = true; b.className = "taken"; b.title = "Already taken by another player or bot"; }
     if (sel.includes(n)) b.className = "sel";
     b.onclick = () => { if (sel.includes(n)) sel = sel.filter((x) => x !== n); else if (sel.length < room) sel.push(n); else flash(`Up to ${S.max} cards per player`); drawPicker(); };
     box.append(b);
