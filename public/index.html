@@ -195,7 +195,7 @@ function showWinnerPopup(w) {
 function showGlobalWinnerPopup(m) {
   const winners = Array.isArray(m.winners) ? m.winners : [];
   $("winnerPopName").textContent = winners.length
-    ? winners.map(w => `${(w.names || ["Winner"]).join(", ")}${w.isBot ? " (Bot)" : ""}`).join(" · ")
+    ? winners.map(w => (w.names || ["Winner"]).join(", ")).join(" · ")
     : "No winner this round";
   $("winnerPopCard").textContent = winners.length
     ? winners.map(w => `Card #${w.cardNo} — ${w.pattern || "Bingo"}`).join(" | ")
@@ -225,7 +225,7 @@ function render() {
   } else { ball.style.setProperty("--c", "#555"); ball.textContent = "–"; }
   lastDrawn = last || 0;
   $("hist").innerHTML = d.slice(0, -1).reverse().map((n) => `<i style="--c:${colorOf(n)}">${n}</i>`).join("");
-  const st = $("status"), sub = $("sub"), info = `${s.players} players + ${s.bots} bots · prize ${s.prize} birr`;
+  const st = $("status"), sub = $("sub"), info = `prize ${s.prize} birr`;
   if (s.phase === "lobby") { st.textContent = s.countdown !== null ? `Starting in ${s.countdown}s` : "Waiting for players"; sub.textContent = info; }
   else if (s.phase === "playing") { st.textContent = "Numbers are being called"; sub.textContent = `${d.length} called · ${info}`; }
   else { st.textContent = "Round over"; sub.textContent = "Next round starts soon"; }
