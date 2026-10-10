@@ -16,6 +16,8 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--N);outline-offs
 button:disabled{opacity:.45}
 .top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .bal{font-size:26px;font-weight:800}.bal small{font-size:14px;color:var(--mute);font-weight:500;margin-right:6px}
+.prize-box{font-size:26px;font-weight:800;color:#5be3a3;text-align:right}
+.prize-box small{font-size:14px;color:var(--mute);font-weight:500;margin-right:6px}
 .row{display:flex;gap:8px}.row button{padding:8px 14px;background:var(--panel)}
 .stage{display:flex;align-items:center;gap:16px;margin:16px 0}
 .ball{width:104px;height:104px;border-radius:50%;flex:none;display:grid;place-items:center;text-align:center;
@@ -101,6 +103,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 </div>
 <div class="top">
   <div class="bal"><small>Balance</small><span id="bal">–</span> birr</div>
+  <div class="prize-box"><small>Prize</small><span id="prizeTop">–</span> birr</div>
 </div>
 
 <main id="pgPlay">
@@ -129,6 +132,9 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
     <label for="dTx">Transaction ID from the Telebirr SMS</label><input id="dTx" maxlength="14" autocapitalize="characters" placeholder="DJ53G7TAZ1">
     <p class="msg" id="dMsg"></p><button class="cta" id="dSend" style="margin-top:0">Deposit</button></section>
   <section class="pcard"><h3>Withdraw to Telebirr</h3>
+    <p class="mute" style="font-size:13px;margin:0 0 8px">
+      ⚠️ You must have deposited at least <b>100 birr</b> to withdraw.
+    </p>
     <label for="wAmt">Amount (birr)</label><input id="wAmt" type="number" inputmode="numeric">
     <label for="wPh">Telebirr phone number</label><input id="wPh" type="tel" placeholder="09XXXXXXXX">
     <p class="msg" id="wMsg"></p><button class="cta" id="wSend" style="margin-top:0">Request withdrawal</button></section>
@@ -212,12 +218,26 @@ function render() {
   lastDrawn = last || 0;
   $("hist").innerHTML = d.slice(0, -1).reverse().map((n) => `<i style="--c:${colorOf(n)}">${n}</i>`).join("");
   const st = $("status"), sub = $("sub"), info = `prize ${s.prize} birr`;
+
+  // ---- Update the new top-right prize box ----
+  const pt = $("prizeTop");
+  if (pt) pt.textContent = s.prize ?? 0;
+
   if (s.phase === "lobby") { st.textContent = s.countdown !== null ? `Starting in ${s.countdown}s` : "Waiting for players"; sub.textContent = info; }
   else if (s.phase === "playing") { st.textContent = "Numbers are being called"; sub.textContent = `${d.length} called · ${info}`; }
   else { st.textContent = "Round over"; sub.textContent = "Next round starts soon"; }
   $("win").hidden = !s.winner;
   if (s.winner) {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
+    const winnerKey = JSON.stringify({
+      names: s.winner.names || [],
+      you: !!s.winner.you,
+      prize: s.winner.prize,
+      card: s.winner.card ?? s.winner.cardNo ?? s.winner.no
+    });
+    if (winnerKey !== lastWinnerKey) lastWinnerKey = winnerKey;
+  } else {
+    lastWinnerKey = "";
   }
   const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
   $("pick").hidden = !canBuy; if (canBuy) drawPicker();
