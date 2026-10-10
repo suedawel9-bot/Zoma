@@ -217,15 +217,24 @@ function render() {
   } else { ball.style.setProperty("--c", "#555"); ball.textContent = "–"; }
   lastDrawn = last || 0;
   $("hist").innerHTML = d.slice(0, -1).reverse().map((n) => `<i style="--c:${colorOf(n)}">${n}</i>`).join("");
-  const st = $("status"), sub = $("sub"), info = `prize ${s.prize} birr`;
 
-  // ---- Update the new top-right prize box ----
+  const st = $("status"), sub = $("sub");
+
+  // ---- Update the top-right prize box ----
   const pt = $("prizeTop");
   if (pt) pt.textContent = s.prize ?? 0;
 
-  if (s.phase === "lobby") { st.textContent = s.countdown !== null ? `Starting in ${s.countdown}s` : "Waiting for players"; sub.textContent = info; }
-  else if (s.phase === "playing") { st.textContent = "Numbers are being called"; sub.textContent = `${d.length} called · ${info}`; }
-  else { st.textContent = "Round over"; sub.textContent = "Next round starts soon"; }
+  if (s.phase === "lobby") {
+    st.textContent = s.countdown !== null ? `Starting in ${s.countdown}s` : "Waiting for players";
+    sub.textContent = "";
+  } else if (s.phase === "playing") {
+    st.textContent = "Numbers are being called";
+    sub.textContent = `${d.length} called`;
+  } else {
+    st.textContent = "Round over";
+    sub.textContent = "Next round starts soon";
+  }
+
   $("win").hidden = !s.winner;
   if (s.winner) {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
