@@ -75,9 +75,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 .win{background:var(--G);border-radius:16px;padding:12px;text-align:center;font-size:20px;font-weight:800;margin-bottom:12px}
 @media (prefers-reduced-motion:reduce){.ball.pop{animation:none}}
 
-/* ============================================================
-   NUMBER GRID + PREVIEW
-   ============================================================ */
+/* NUMBER GRID + PREVIEW */
 .nums{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(40px,1fr));
@@ -120,7 +118,6 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
   text-decoration:none;
 }
 
-/* Preview section — physically below the number grid */
 #prev{
   display:grid;
   grid-template-columns:repeat(4,1fr);
@@ -340,10 +337,13 @@ function render() {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
   }
 
-  const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
-  $("pick").hidden = !canBuy; if (canBuy) drawPicker();
+  // Picker visible during lobby — regardless of how many cards the player owns.
+  // The 4-card limit is enforced inside each button click, not here.
+  $("pick").hidden = s.phase !== "lobby";
+  if (s.phase === "lobby") drawPicker();
 
-  // Hide full-size cards during lobby — only show them when playing/over
+  // Big cards hidden during lobby, shown during playing/over
+  const own = s.cards.length;
   $("play").hidden = !own || s.phase === "lobby";
 
   const count = s.cards.length;
