@@ -343,7 +343,7 @@ function render() {
   const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
   $("pick").hidden = !canBuy; if (canBuy) drawPicker();
 
-  // Hide full-size cards during lobby — they're shown as tiny previews there
+  // Hide full-size cards during lobby — only show them when playing/over
   $("play").hidden = !own || s.phase === "lobby";
 
   const count = s.cards.length;
@@ -372,7 +372,7 @@ function drawPicker() {
     box.append(b);
   }
   box.scrollTop = top;
-  // Tiny preview of the cards the player owns — renders BELOW the number grid
+  // Tiny preview — below the number grid
   const ownedCards = (S.cards || []);
   $("prev").innerHTML = ownedCards.map((c) =>
     `<div class="card"><p class="cn">#${c.no}</p><div class="grid">${heads()}${cells(c.card)}</div></div>`
