@@ -77,17 +77,22 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 .nums{display:grid;grid-template-columns:repeat(auto-fill,minmax(40px,1fr));gap:5px;margin:10px 0}
 .nums button{padding:7px 0;background:var(--panel);font-size:14px;border-radius:10px;transition:background .15s}
 .nums button:disabled{opacity:.25}.nums button.sel{background:var(--N);color:#111}
-.nums button.pending{background:var(--G);color:#fff;animation:blink 0.6s ease-in-out infinite alternate}
-@keyframes blink{from{opacity:.6}to{opacity:1}}
 .nums button.taken:disabled{opacity:1;background:#5b2638;color:#ffc1c8;border:1px solid #c65a70;text-decoration:line-through;position:relative;cursor:not-allowed}
 .nums button.taken:disabled::after{content:"×";position:absolute;top:-5px;right:-3px;width:15px;height:15px;border-radius:50%;display:grid;place-items:center;background:#e8455b;color:#fff;font-size:12px;line-height:1;font-weight:800;text-decoration:none}
 
-/* Ultra-tiny preview cards — 4 per row, very small */
+/* Preview section — below number grid */
 .prev{
-  margin-top:8px;
+  margin-top:14px;
+  padding-top:10px;
+  border-top:1px solid #3a3f86;
   display:grid;
   grid-template-columns:repeat(4,1fr);
   gap:4px;
+}
+.prev:empty{
+  margin-top:0;
+  padding-top:0;
+  border-top:none;
 }
 .prev .card{
   padding:3px 2px;
@@ -158,7 +163,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 <div id="pick" hidden>
   <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
   <p class="mute" style="font-size:13px;margin:4px 0 10px">
-    ⚡ Tap a number to buy it instantly · tap again within 5s to cancel
+    ⚡ Tap a number to buy · tap again to refund
   </p>
   <div class="nums" id="nums"></div>
   <div class="prev" id="prev"></div>
@@ -196,6 +201,7 @@ const colorOf = (n) => `var(${CC[Math.min(4, Math.floor((n - 1) / 15))]})`;
 const letterOf = (n) => COL[Math.min(4, Math.floor((n - 1) / 15))];
 let ws, S = null, marks = new Set(), cardKey = "", lastDrawn = 0, info = {};
 let lastWinnerKey = "", winnerTimer = null;
+let sel = [], pk = "";
 
 const api = async (path, body) => {
   const r = await fetch(path, { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json", "x-init": tg.initData }, body: body && JSON.stringify(body) });
@@ -214,22 +220,11 @@ function connect() {
     if (m.type === "winner_popup") showGlobalWinnerPopup(m);
     if (m.type === "state") {
       S = m;
-      // Clear the tiny preview when the round is not in lobby
-      if (m.phase !== "lobby") {
-        sel = [];
-        pk = "";
-        $("prev").innerHTML = "";
-        pendingPurchase.forEach(t => clearTimeout(t));
-        pendingPurchase.clear();
-      }
+      if (m.phase !== "lobby") { sel = []; pk = ""; $("prev").innerHTML = ""; }
       render();
     }
   };
 }
-
-// ==UI==
-let sel = [], pk = "";
-const pendingPurchase = new Map();
 
 const line = (c, d) => {
   const ok = (n) => n === 0 || d.includes(n), L = [];
@@ -275,7 +270,6 @@ function render() {
   $("hist").innerHTML = d.slice(0, -1).reverse().map((n) => `<i style="--c:${colorOf(n)}">${n}</i>`).join("");
 
   const st = $("status"), sub = $("sub");
-
   const pt = $("prizeTop");
   if (pt) pt.textContent = s.prize ?? 0;
 
@@ -293,16 +287,8 @@ function render() {
   $("win").hidden = !s.winner;
   if (s.winner) {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
-    const winnerKey = JSON.stringify({
-      names: s.winner.names || [],
-      you: !!s.winner.you,
-      prize: s.winner.prize,
-      card: s.winner.card ?? s.winner.cardNo ?? s.winner.no
-    });
-    if (winnerKey !== lastWinnerKey) lastWinnerKey = winnerKey;
-  } else {
-    lastWinnerKey = "";
   }
+
   const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
   $("pick").hidden = !canBuy; if (canBuy) drawPicker();
   $("play").hidden = !own;
@@ -314,43 +300,31 @@ function render() {
 }
 
 function drawPicker() {
-  const t = new Set([...(S.taken || []), ...(S.cards || []).map(c => c.no)]), room = S.max - S.cards.length;
-  sel = sel.filter((n) => !t.has(n)).slice(0, room);
-  const key = [...t].join() + "|" + sel.join() + "|" + [...pendingPurchase.keys()].join(); if (key === pk) return; pk = key;
+  const t = new Set([...(S.taken || []), ...(S.cards || []).map(c => c.no)]);
+  sel = sel.filter((n) => !t.has(n));
+  const key = [...t].join() + "|" + sel.join(); if (key === pk) return; pk = key;
   const box = $("nums"), top = box.scrollTop; box.innerHTML = "";
   for (let n = 1; n <= TOTAL; n++) {
     const b = document.createElement("button"); b.textContent = n;
-    if (t.has(n)) { b.disabled = true; b.className = "taken"; b.title = "Already taken by another player or bot"; }
-    if (sel.includes(n)) b.className = "sel";
-    if (pendingPurchase.has(n)) { b.className = "pending"; b.textContent = "✓"; }
+    if (t.has(n)) { b.disabled = true; b.className = "taken"; b.title = "Already taken"; }
     b.onclick = () => {
       if (t.has(n)) return;
-      if (pendingPurchase.has(n)) {
-        clearTimeout(pendingPurchase.get(n));
-        pendingPurchase.delete(n);
-        pk = ""; drawPicker();
-        flash("Cancelled");
-        return;
-      }
+      const owned = (S.cards || []).some(c => c.no === n);
+      if (owned) { ws.send(JSON.stringify({ type: "leave", card: n })); pk = ""; return; }
       if (S.cards.length >= S.max) { flash(`Up to ${S.max} cards per player`); return; }
-      b.className = "pending"; b.textContent = "✓";
-      const timer = setTimeout(() => {
-        pendingPurchase.delete(n);
-        ws.send(JSON.stringify({ type: "join", cards: [n] }));
-        pk = ""; drawPicker();
-      }, 5000);
-      pendingPurchase.set(n, timer);
+      ws.send(JSON.stringify({ type: "join", cards: [n] }));
+      pk = "";
     };
     box.append(b);
   }
   box.scrollTop = top;
-  // Ultra-tiny preview of the selected cards
-  $("prev").innerHTML = sel.map((n) =>
-    `<div class="card"><p class="cn">#${n}</p><div class="grid">${heads()}${cells(cardFor(n))}</div></div>`
+  // Preview of cards the player owns (below the number grid)
+  const ownedCards = (S.cards || []);
+  $("prev").innerHTML = ownedCards.map((c) =>
+    `<div class="card"><p class="cn">#${c.no}</p><div class="grid">${heads()}${cells(c.card)}</div></div>`
   ).join("");
 }
 
-// ==END UI==
 $("jump").oninput = () => {
   const n = parseInt($("jump").value);
   if (n >= 1 && n <= TOTAL) {
