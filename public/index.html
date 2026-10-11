@@ -20,7 +20,7 @@ button:disabled{opacity:.45}
 .prize-box small{font-size:14px;color:var(--mute);font-weight:500;margin-right:6px}
 .row{display:flex;gap:8px}.row button{padding:8px 14px;background:var(--panel)}
 
-/* Smaller stage — ball + status text */
+/* Compact stage — ball + status text */
 .stage{display:flex;align-items:center;gap:10px;margin:8px 0}
 .ball{width:64px;height:64px;border-radius:50%;flex:none;display:grid;place-items:center;text-align:center;
 background:radial-gradient(circle at 32% 28%,#fff 0 18%,var(--c,#555) 19%);color:#111;font-size:28px;font-weight:800;line-height:1;
@@ -82,7 +82,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
   display:grid;
   grid-template-columns:repeat(10,1fr);
   gap:3px;
-  margin:10px 0 16px;
+  margin:0 0 16px;
 }
 .nums button{
   padding:6px 0;
@@ -172,10 +172,6 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 <div id="play" hidden><div id="cards"></div></div>
 
 <div id="pick" hidden>
-  <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
-  <p class="mute" style="font-size:13px;margin:4px 0 10px">
-    ⚡ Tap a number to buy · tap again to refund
-  </p>
   <div class="nums" id="nums"></div>
   <div id="prev"></div>
 </div>
@@ -336,14 +332,6 @@ function drawPicker() {
     `<div class="card"><p class="cn">#${c.no}</p><div class="grid">${heads()}${cells(c.card)}</div></div>`
   ).join("");
 }
-
-$("jump").oninput = () => {
-  const n = parseInt($("jump").value);
-  if (n >= 1 && n <= TOTAL) {
-    pk = ""; drawPicker();
-    $("nums").children[n - 1].scrollIntoView({ block: "center" });
-  }
-};
 
 async function loadMe() {
   try {
