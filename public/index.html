@@ -20,7 +20,7 @@ button:disabled{opacity:.45}
 .prize-box small{font-size:14px;color:var(--mute);font-weight:500;margin-right:6px}
 .row{display:flex;gap:8px}.row button{padding:8px 14px;background:var(--panel)}
 
-/* Compact stage — ball + status text */
+/* Compact stage */
 .stage{display:flex;align-items:center;gap:10px;margin:8px 0}
 .ball{width:64px;height:64px;border-radius:50%;flex:none;display:grid;place-items:center;text-align:center;
 background:radial-gradient(circle at 32% 28%,#fff 0 18%,var(--c,#555) 19%);color:#111;font-size:28px;font-weight:800;line-height:1;
@@ -77,7 +77,9 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 .win{background:var(--G);border-radius:16px;padding:12px;text-align:center;font-size:20px;font-weight:800;margin-bottom:12px}
 @media (prefers-reduced-motion:reduce){.ball.pop{animation:none}}
 
-/* NUMBER GRID — 10 columns × 50 rows */
+/* ============================================================
+   NUMBER GRID — 10 columns × 50 rows
+   ============================================================ */
 .nums{
   display:grid;
   grid-template-columns:repeat(10,1fr);
@@ -94,6 +96,8 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 }
 .nums button:disabled{opacity:.25}
 .nums button.sel{background:var(--N);color:#111}
+
+/* Cards taken by OTHER players — red with × */
 .nums button.taken:disabled{
   opacity:1;
   background:#5b2638;
@@ -119,6 +123,31 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
   line-height:1;
   font-weight:800;
   text-decoration:none;
+}
+
+/* Cards owned by YOU — green with ✓ (tap to refund) */
+.nums button.mine{
+  background:#1b6b3a;
+  color:#c9f5d8;
+  border:1px solid #22a06b;
+  position:relative;
+  cursor:pointer;
+}
+.nums button.mine::after{
+  content:"✓";
+  position:absolute;
+  top:-5px;
+  right:-3px;
+  width:13px;
+  height:13px;
+  border-radius:50%;
+  display:grid;
+  place-items:center;
+  background:#22a06b;
+  color:#fff;
+  font-size:11px;
+  line-height:1;
+  font-weight:800;
 }
 
 /* Tiny preview below the number grid */
@@ -285,6 +314,7 @@ function render() {
     sub.textContent = `${d.length} called`;
   } else {
     st.textContent = "Round over";
+    st.textContent = "Round over";
     sub.textContent = "Next round starts soon";
   }
 
@@ -293,11 +323,9 @@ function render() {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
   }
 
-  // Picker visible during lobby
   $("pick").hidden = s.phase !== "lobby";
   if (s.phase === "lobby") drawPicker();
 
-  // Big cards hidden during lobby, visible during playing/over
   const own = s.cards.length;
   $("play").hidden = !own || s.phase === "lobby";
 
@@ -315,11 +343,26 @@ function drawPicker() {
   const box = $("nums"), top = box.scrollTop; box.innerHTML = "";
   for (let n = 1; n <= TOTAL; n++) {
     const b = document.createElement("button"); b.textContent = n;
-    if (t.has(n)) { b.disabled = true; b.className = "taken"; b.title = "Already taken"; }
+    const ownedByMe = (S.cards || []).some(c => c.no === n);
+
+    if (ownedByMe) {
+      // Green with ✓ — your own card, click to refund
+      b.className = "mine";
+      b.title = "Your card — tap to refund";
+    } else if (t.has(n)) {
+      // Red with × — taken by another player
+      b.disabled = true;
+      b.className = "taken";
+      b.title = "Taken by another player";
+    }
+
     b.onclick = () => {
+      if (ownedByMe) {
+        ws.send(JSON.stringify({ type: "leave", card: n }));
+        pk = "";
+        return;
+      }
       if (t.has(n)) return;
-      const owned = (S.cards || []).some(c => c.no === n);
-      if (owned) { ws.send(JSON.stringify({ type: "leave", card: n })); pk = ""; return; }
       if (S.cards.length >= S.max) { flash(`Up to ${S.max} cards per player`); return; }
       ws.send(JSON.stringify({ type: "join", cards: [n] }));
       pk = "";
