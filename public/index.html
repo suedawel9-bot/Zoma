@@ -82,15 +82,47 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 .nums button.taken:disabled{opacity:1;background:#5b2638;color:#ffc1c8;border:1px solid #c65a70;text-decoration:line-through;position:relative;cursor:not-allowed}
 .nums button.taken:disabled::after{content:"×";position:absolute;top:-5px;right:-3px;width:15px;height:15px;border-radius:50%;display:grid;place-items:center;background:#e8455b;color:#fff;font-size:12px;line-height:1;font-weight:800;text-decoration:none}
 
-/* Tiny preview cards (selected numbers below the grid) */
-.prev{margin-top:10px;display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
-.prev .card{padding:4px;border-radius:8px;margin:0;background:var(--paper);color:#111}
-.prev .card .cn{font-size:9px;margin:0 0 3px;font-weight:700;color:#555}
-.prev .card .grid{gap:2px}
-.prev .card .c{font-size:8px;border-width:1px;border-radius:3px;aspect-ratio:1}
-.prev .card .h{height:11px;font-size:8px;border-radius:2px}
-.prev .card .c.free{font-size:6px}
-.prev .card.win{box-shadow:0 0 0 2px var(--G)}
+/* Ultra-tiny preview cards — 4 per row, very small */
+.prev{
+  margin-top:8px;
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:4px;
+}
+.prev .card{
+  padding:3px 2px;
+  border-radius:5px;
+  margin:0;
+  background:var(--paper);
+  color:#111;
+}
+.prev .card .cn{
+  font-size:7px;
+  margin:0 0 2px;
+  font-weight:700;
+  color:#555;
+  text-align:center;
+  line-height:1;
+}
+.prev .card .grid{
+  gap:1px;
+}
+.prev .card .c{
+  font-size:5px;
+  border:0;
+  border-radius:1px;
+  aspect-ratio:1;
+  color:#1b1e4d;
+  background:#fff;
+}
+.prev .card .h{
+  height:6px;
+  font-size:5px;
+  border-radius:1px;
+}
+.prev .card .c.free{
+  font-size:4px;
+}
 
 .pcard{background:var(--panel);border-radius:18px;padding:14px;margin:12px 0}.pcard h3{margin:0 0 4px}
 .who{display:flex;align-items:center;gap:12px}.av{width:52px;height:52px;border-radius:50%;background:var(--O);display:grid;place-items:center;font-size:24px;font-weight:800}
@@ -180,7 +212,18 @@ function connect() {
     if (m.type === "balance") $("bal").textContent = m.balance;
     if (m.type === "error") flash(m.msg);
     if (m.type === "winner_popup") showGlobalWinnerPopup(m);
-    if (m.type === "state") { S = m; render(); }
+    if (m.type === "state") {
+      S = m;
+      // Clear the tiny preview when the round is not in lobby
+      if (m.phase !== "lobby") {
+        sel = [];
+        pk = "";
+        $("prev").innerHTML = "";
+        pendingPurchase.forEach(t => clearTimeout(t));
+        pendingPurchase.clear();
+      }
+      render();
+    }
   };
 }
 
@@ -301,7 +344,7 @@ function drawPicker() {
     box.append(b);
   }
   box.scrollTop = top;
-  // Tiny preview of the selected cards
+  // Ultra-tiny preview of the selected cards
   $("prev").innerHTML = sel.map((n) =>
     `<div class="card"><p class="cn">#${n}</p><div class="grid">${heads()}${cells(cardFor(n))}</div></div>`
   ).join("");
