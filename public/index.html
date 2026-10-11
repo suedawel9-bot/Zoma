@@ -50,7 +50,7 @@ box-shadow:0 8px 0 rgba(0,0,0,.25)}
 }
 
 .h{height:32px;min-width:0;border-radius:9px;color:#fff;display:grid;place-items:center;font-size:18px;font-weight:800}
-.c{aspect-ratio:1;min-width:0;width:100%;border-radius:10px;background:#fff;border:2px solid #dedaf3;color:#1b1e4d;font-size:20px;font-weight:800;padding:0;line-height:1}
+.c{aspect-ratio:1;min-width:0;width:100%;border-radius:10px;background:#fff;border:2px solid #dedaf3;color:#1b1e4d;font-size:20px;font-weight:800;padding:0;line-height:1;display:grid;place-items:center}
 .c.hit{box-shadow:inset 0 0 0 3px var(--N)}
 .c.mk{background:var(--cell);color:#fff;border-color:var(--cell)}
 .c.free{background:var(--N);border-color:var(--N);color:#111;font-size:11px}
@@ -81,9 +81,16 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 @keyframes blink{from{opacity:.6}to{opacity:1}}
 .nums button.taken:disabled{opacity:1;background:#5b2638;color:#ffc1c8;border:1px solid #c65a70;text-decoration:line-through;position:relative;cursor:not-allowed}
 .nums button.taken:disabled::after{content:"×";position:absolute;top:-5px;right:-3px;width:15px;height:15px;border-radius:50%;display:grid;place-items:center;background:#e8455b;color:#fff;font-size:12px;line-height:1;font-weight:800;text-decoration:none}
-.prev{margin-top:8px}.prev .c{font-size:18px;display:grid;place-items:center}
-.c{display:grid;place-items:center}.cn{margin:0 0 6px;font-weight:800;color:#555}.card.win{box-shadow:0 0 0 4px var(--G)}
-.prev .card{margin-bottom:10px}
+
+/* Tiny preview cards (selected numbers below the grid) */
+.prev{margin-top:10px;display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.prev .card{padding:4px;border-radius:8px;margin:0;background:var(--paper);color:#111}
+.prev .card .cn{font-size:9px;margin:0 0 3px;font-weight:700;color:#555}
+.prev .card .grid{gap:2px}
+.prev .card .c{font-size:8px;border-width:1px;border-radius:3px;aspect-ratio:1}
+.prev .card .h{height:11px;font-size:8px;border-radius:2px}
+.prev .card .c.free{font-size:6px}
+.prev .card.win{box-shadow:0 0 0 2px var(--G)}
 
 .pcard{background:var(--panel);border-radius:18px;padding:14px;margin:12px 0}.pcard h3{margin:0 0 4px}
 .who{display:flex;align-items:center;gap:12px}.av{width:52px;height:52px;border-radius:50%;background:var(--O);display:grid;place-items:center;font-size:24px;font-weight:800}
@@ -119,7 +126,7 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 <div id="pick" hidden>
   <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
   <p class="mute" style="font-size:13px;margin:4px 0 10px">
-    ⚡ Tap a number to buy it instantly · tap again within 1.5s to cancel
+    ⚡ Tap a number to buy it instantly · tap again within 5s to cancel
   </p>
   <div class="nums" id="nums"></div>
   <div class="prev" id="prev"></div>
@@ -288,13 +295,16 @@ function drawPicker() {
         pendingPurchase.delete(n);
         ws.send(JSON.stringify({ type: "join", cards: [n] }));
         pk = ""; drawPicker();
-      }, 1500);
+      }, 5000);
       pendingPurchase.set(n, timer);
     };
     box.append(b);
   }
   box.scrollTop = top;
-  $("prev").innerHTML = "";
+  // Tiny preview of the selected cards
+  $("prev").innerHTML = sel.map((n) =>
+    `<div class="card"><p class="cn">#${n}</p><div class="grid">${heads()}${cells(cardFor(n))}</div></div>`
+  ).join("");
 }
 
 // ==END UI==
