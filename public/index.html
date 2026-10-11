@@ -77,7 +77,6 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 
 /* ============================================================
    NUMBER GRID + PREVIEW
-   Preview is FORCED below the number grid via DOM order + CSS.
    ============================================================ */
 .nums{
   display:grid;
@@ -212,13 +211,6 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 
 <div id="play" hidden><div id="cards"></div></div>
 
-<!--
-  PICK SECTION — strict order:
-  1) jump input
-  2) hint text
-  3) #nums  (number grid)
-  4) #prev  (preview) — MUST be below #nums
--->
 <div id="pick" hidden>
   <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
   <p class="mute" style="font-size:13px;margin:4px 0 10px">
@@ -350,7 +342,10 @@ function render() {
 
   const own = s.cards.length, canBuy = s.phase === "lobby" && own < s.max;
   $("pick").hidden = !canBuy; if (canBuy) drawPicker();
-  $("play").hidden = !own;
+
+  // Hide full-size cards during lobby — they're shown as tiny previews there
+  $("play").hidden = !own || s.phase === "lobby";
+
   const count = s.cards.length;
   const layoutClass = count >= 4 ? "cards-4" : count === 3 ? "cards-3" : count === 2 ? "cards-2" : "cards-1";
   $("cards").className = `cards-wrap ${layoutClass}`;
@@ -377,7 +372,7 @@ function drawPicker() {
     box.append(b);
   }
   box.scrollTop = top;
-  // Preview of the cards the player owns — renders BELOW the number grid
+  // Tiny preview of the cards the player owns — renders BELOW the number grid
   const ownedCards = (S.cards || []);
   $("prev").innerHTML = ownedCards.map((c) =>
     `<div class="card"><p class="cn">#${c.no}</p><div class="grid">${heads()}${cells(c.card)}</div></div>`
