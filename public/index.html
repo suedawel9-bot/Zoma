@@ -74,34 +74,76 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 .acct b{font-size:20px}
 .win{background:var(--G);border-radius:16px;padding:12px;text-align:center;font-size:20px;font-weight:800;margin-bottom:12px}
 @media (prefers-reduced-motion:reduce){.ball.pop{animation:none}}
-.nums{display:grid;grid-template-columns:repeat(auto-fill,minmax(40px,1fr));gap:5px;margin:10px 0}
-.nums button{padding:7px 0;background:var(--panel);font-size:14px;border-radius:10px;transition:background .15s}
-.nums button:disabled{opacity:.25}.nums button.sel{background:var(--N);color:#111}
-.nums button.taken:disabled{opacity:1;background:#5b2638;color:#ffc1c8;border:1px solid #c65a70;text-decoration:line-through;position:relative;cursor:not-allowed}
-.nums button.taken:disabled::after{content:"×";position:absolute;top:-5px;right:-3px;width:15px;height:15px;border-radius:50%;display:grid;place-items:center;background:#e8455b;color:#fff;font-size:12px;line-height:1;font-weight:800;text-decoration:none}
 
-/* Preview section — below number grid */
-.prev{
-  margin-top:14px;
-  padding-top:10px;
-  border-top:1px solid #3a3f86;
+/* ============================================================
+   NUMBER GRID + PREVIEW
+   Preview is FORCED below the number grid via DOM order + CSS.
+   ============================================================ */
+.nums{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(40px,1fr));
+  gap:5px;
+  margin:10px 0 16px;
+}
+.nums button{
+  padding:7px 0;
+  background:var(--panel);
+  font-size:14px;
+  border-radius:10px;
+  transition:background .15s;
+}
+.nums button:disabled{opacity:.25}
+.nums button.sel{background:var(--N);color:#111}
+.nums button.taken:disabled{
+  opacity:1;
+  background:#5b2638;
+  color:#ffc1c8;
+  border:1px solid #c65a70;
+  text-decoration:line-through;
+  position:relative;
+  cursor:not-allowed;
+}
+.nums button.taken:disabled::after{
+  content:"×";
+  position:absolute;
+  top:-5px;
+  right:-3px;
+  width:15px;
+  height:15px;
+  border-radius:50%;
+  display:grid;
+  place-items:center;
+  background:#e8455b;
+  color:#fff;
+  font-size:12px;
+  line-height:1;
+  font-weight:800;
+  text-decoration:none;
+}
+
+/* Preview section — physically below the number grid */
+#prev{
   display:grid;
   grid-template-columns:repeat(4,1fr);
   gap:4px;
-}
-.prev:empty{
+  width:100%;
   margin-top:0;
+  padding-top:14px;
+  border-top:1px solid #3a3f86;
+}
+#prev:empty{
   padding-top:0;
   border-top:none;
 }
-.prev .card{
+#prev .card{
   padding:3px 2px;
   border-radius:5px;
   margin:0;
   background:var(--paper);
   color:#111;
+  min-width:0;
 }
-.prev .card .cn{
+#prev .card .cn{
   font-size:7px;
   margin:0 0 2px;
   font-weight:700;
@@ -109,24 +151,33 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
   text-align:center;
   line-height:1;
 }
-.prev .card .grid{
+#prev .card .grid{
+  display:grid;
+  grid-template-columns:repeat(5,minmax(0,1fr));
   gap:1px;
 }
-.prev .card .c{
+#prev .card .c{
   font-size:5px;
   border:0;
   border-radius:1px;
   aspect-ratio:1;
   color:#1b1e4d;
   background:#fff;
+  display:grid;
+  place-items:center;
 }
-.prev .card .h{
+#prev .card .h{
   height:6px;
   font-size:5px;
   border-radius:1px;
+  display:grid;
+  place-items:center;
+  color:#fff;
 }
-.prev .card .c.free{
+#prev .card .c.free{
   font-size:4px;
+  background:var(--N);
+  color:#111;
 }
 
 .pcard{background:var(--panel);border-radius:18px;padding:14px;margin:12px 0}.pcard h3{margin:0 0 4px}
@@ -160,13 +211,21 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
 <div class="hist" id="hist"></div>
 
 <div id="play" hidden><div id="cards"></div></div>
+
+<!--
+  PICK SECTION — strict order:
+  1) jump input
+  2) hint text
+  3) #nums  (number grid)
+  4) #prev  (preview) — MUST be below #nums
+-->
 <div id="pick" hidden>
   <input id="jump" type="number" inputmode="numeric" min="1" max="500" placeholder="Type a card number">
   <p class="mute" style="font-size:13px;margin:4px 0 10px">
     ⚡ Tap a number to buy · tap again to refund
   </p>
   <div class="nums" id="nums"></div>
-  <div class="prev" id="prev"></div>
+  <div id="prev"></div>
 </div>
 <p class="msg" id="msg" role="status"></p>
 </main>
@@ -318,7 +377,7 @@ function drawPicker() {
     box.append(b);
   }
   box.scrollTop = top;
-  // Preview of cards the player owns (below the number grid)
+  // Preview of the cards the player owns — renders BELOW the number grid
   const ownedCards = (S.cards || []);
   $("prev").innerHTML = ownedCards.map((c) =>
     `<div class="card"><p class="cn">#${c.no}</p><div class="grid">${heads()}${cells(c.card)}</div></div>`
