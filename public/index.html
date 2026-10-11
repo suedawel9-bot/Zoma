@@ -227,9 +227,6 @@ input{width:100%;padding:12px;border-radius:12px;border:2px solid #3a3f86;backgr
     <label for="dTx">Transaction ID from the Telebirr SMS</label><input id="dTx" maxlength="14" autocapitalize="characters" placeholder="DJ53G7TAZ1">
     <p class="msg" id="dMsg"></p><button class="cta" id="dSend" style="margin-top:0">Deposit</button></section>
   <section class="pcard"><h3>Withdraw to Telebirr</h3>
-    <p class="mute" style="font-size:13px;margin:0 0 8px">
-      ⚠️ You must have deposited at least <b>100 birr</b> to withdraw.
-    </p>
     <label for="wAmt">Amount (birr)</label><input id="wAmt" type="number" inputmode="numeric">
     <label for="wPh">Telebirr phone number</label><input id="wPh" type="tel" placeholder="09XXXXXXXX">
     <p class="msg" id="wMsg"></p><button class="cta" id="wSend" style="margin-top:0">Request withdrawal</button></section>
@@ -337,12 +334,11 @@ function render() {
     $("win").textContent = `${(s.winner.winners || []).length || s.winner.names.length} winner(s) · prize pool ${s.winner.prize} birr`;
   }
 
-  // Picker visible during lobby — regardless of how many cards the player owns.
-  // The 4-card limit is enforced inside each button click, not here.
+  // Picker visible during lobby (grid + preview), regardless of card count
   $("pick").hidden = s.phase !== "lobby";
   if (s.phase === "lobby") drawPicker();
 
-  // Big cards hidden during lobby, shown during playing/over
+  // Big cards visible only during playing / over
   const own = s.cards.length;
   $("play").hidden = !own || s.phase === "lobby";
 
@@ -372,7 +368,7 @@ function drawPicker() {
     box.append(b);
   }
   box.scrollTop = top;
-  // Tiny preview — below the number grid
+  // Tiny preview of owned cards, below the number grid
   const ownedCards = (S.cards || []);
   $("prev").innerHTML = ownedCards.map((c) =>
     `<div class="card"><p class="cn">#${c.no}</p><div class="grid">${heads()}${cells(c.card)}</div></div>`
