@@ -1,6 +1,6 @@
 // ============================================================
 // ZOMA BINGO — Telegram Mini App Server
-// Updated: 2026-10-11 — Four Corners pattern added
+// Updated: 2026-10-11 — instant buy/undo toggle + Four Corners
 // ============================================================
 
 console.log("🔥 ZOMA BINGO SERVER 2026-10-11");
@@ -128,7 +128,7 @@ async function tgNotify(chatId, text) {
 }
 
 // ============================================================
-// ENSURE USER (with referral) + AUTH
+// ENSURE USER + AUTH
 // ============================================================
 
 async function ensureUser(tgUser, startParam) {
@@ -436,17 +436,12 @@ function callNext() {
   sendState();
 }
 
-// ============================================================
-// WINNING PATTERN — includes Four Corners
-// ============================================================
-
 function winningPattern(card, drawnSet) {
   const marked = card.map(row => row.map(n => n === 0 || drawnSet.has(n)));
   for (let r = 0; r < 5; r++) if (marked[r].every(Boolean)) return `Row ${r + 1}`;
   for (let c = 0; c < 5; c++) if (marked.every(row => row[c])) return `Column ${c + 1}`;
   if ([0,1,2,3,4].every(i => marked[i][i])) return "Diagonal ↘";
   if ([0,1,2,3,4].every(i => marked[i][4-i])) return "Diagonal ↙";
-  // Four Corners — all 4 outer corners marked
   if (marked[0][0] && marked[0][4] && marked[4][0] && marked[4][4]) return "Four Corners";
   return null;
 }
@@ -994,6 +989,7 @@ wss.on("connection", (ws) => {
   ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
+
     if (msg.type === "auth") {
       const tg = validateInitData(msg.initData);
       if (!tg) { try { ws.send(JSON.stringify({ type: "error", msg: "Invalid auth" })); } catch {} return; }
@@ -1008,15 +1004,19 @@ wss.on("connection", (ws) => {
       if (game.phase === "lobby" && !game.botSetup && !game.lobbyTimer && game.players.size >= 1) startCountdown();
       return;
     }
+
     if (msg.type === "join") {
       if (!ws.tgId) { try { ws.send(JSON.stringify({ type: "error", msg: "Not authenticated" })); } catch {} return; }
       if (game.phase !== "lobby") { try { ws.send(JSON.stringify({ type: "error", msg: "Round already started" })); } catch {} return; }
+
       const requested = Array.isArray(msg.cards) ? msg.cards : [];
       const player = game.players.get(ws.tgId);
       if (!player) { try { ws.send(JSON.stringify({ type: "error", msg: "Not registered" })); } catch {} return; }
+
       const owned = [...game.cards.values()].filter(e => String(e.owner) === String(ws.tgId)).map(e => e.cardNo);
       const taken = new Set([...game.cards.values()].map(e => e.cardNo));
       const room = MAX_CARDS_PER_PLAYER - owned.length;
+
       const valid = [];
       for (const n of requested) {
         if (!Number.isInteger(n) || n < 1 || n > TOTAL_CARDS) continue;
@@ -1025,7 +1025,8 @@ wss.on("connection", (ws) => {
       }
       const take = valid.slice(0, room);
       const cost = take.length * CARD_PRICE;
-      if (!take.length) { try { ws.send(JSON.stringify({ type: "error", msg: "No valid cards" })); } catch {} return; }
+      if (!take.length) { try { ws.send(JSON.stringify({ type: "error", msg: "No valid cards to buy" })); } catch {} return; }
+
       for (const n of take) game.pendingCards.add(n);
       let client;
       try { client = await pool.connect(); }
@@ -1053,6 +1054,51 @@ wss.on("connection", (ws) => {
       try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
       sendState();
       if (!game.lobbyTimer && game.phase === "lobby" && game.cards.size > 0) startCountdown();
+      return;
+    }
+
+    // ============================================================
+    // LEAVE — refund a card during lobby
+    // ============================================================
+    if (msg.type === "leave") {
+      if (!ws.tgId) { try { ws.send(JSON.stringify({ type: "error", msg: "Not authenticated" })); } catch {} return; }
+      if (game.phase !== "lobby") { try { ws.send(JSON.stringify({ type: "error", msg: "Cannot refund after round starts" })); } catch {} return; }
+
+      const cardNo = Number(msg.card);
+      if (!Number.isInteger(cardNo) || cardNo < 1 || cardNo > TOTAL_CARDS) {
+        try { ws.send(JSON.stringify({ type: "error", msg: "Invalid card" })); } catch {}
+        return;
+      }
+
+      const key = `${ws.tgId}:${cardNo}`;
+      if (!game.cards.has(key)) {
+        try { ws.send(JSON.stringify({ type: "error", msg: "You don't own that card" })); } catch {}
+        return;
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(
+          `UPDATE users SET balance=balance+$1, updated_at=NOW() WHERE telegram_id=$2`,
+          [CARD_PRICE, ws.tgId]
+        );
+        await client.query(
+          `INSERT INTO transactions (telegram_id, type, amount, status, note)
+           VALUES ($1, 'card_refund', $2, 'completed', $3)`,
+          [ws.tgId, CARD_PRICE, `Refunded card #${cardNo}`]
+        );
+        await client.query("COMMIT");
+      } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("leave txn:", e);
+        try { ws.send(JSON.stringify({ type: "error", msg: "Could not refund" })); } catch {}
+        return;
+      } finally { client.release(); }
+
+      game.cards.delete(key);
+      try { ws.send(JSON.stringify({ type: "balance", balance: await getBalance(ws.tgId) })); } catch {}
+      sendState();
       return;
     }
   });
@@ -1157,7 +1203,7 @@ app.post("/api/deposit", authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// WITHDRAW — endpoint with 100 birr deposit gate
+// WITHDRAW
 // ============================================================
 
 app.post("/api/withdraw", authMiddleware, async (req, res) => {
