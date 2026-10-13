@@ -55,11 +55,20 @@ const REFERRAL_BONUS_INVITER = Number(process.env.REFERRAL_BONUS_INVITER || 20);
 
 // Sanitize BOT_USERNAME aggressively so a dirty env var can't produce a
 // malformed invite link like https://t.me/Biinnngobot=@Biinnngobot?start=...
-const BOT_USERNAME = String(process.env.BOT_USERNAME || "Biinnngobot")
-  .trim()
+const RAW_BOT_USERNAME = String(process.env.BOT_USERNAME || "Biinnngobot").trim();
+const BOT_USERNAME = RAW_BOT_USERNAME
   .replace(/^https?:\/\/t\.me\//i, "")   // strip full t.me URL prefix
   .replace(/^@+/, "")                    // strip leading @
   .replace(/[^A-Za-z0-9_]/g, "");       // keep only valid bot username chars
+
+if (BOT_USERNAME !== RAW_BOT_USERNAME) {
+  console.warn(`⚠️ BOT_USERNAME env was dirty: "${RAW_BOT_USERNAME}" → using "${BOT_USERNAME}"`);
+}
+// Telegram bot usernames must be 5–32 chars and end in "bot".
+if (!/^[A-Za-z0-9_]{5,32}bot$/i.test(BOT_USERNAME)) {
+  console.error(`❌ BOT_USERNAME "${BOT_USERNAME}" is not a valid Telegram bot username.`);
+  console.error(`   Set BOT_USERNAME in Railway Variables to exactly: Biinnngobot`);
+}
 
 const TB_RECEIVER_NAME = String(process.env.TB_RECEIVER_NAME || "helen yohaness bitew").trim().toLowerCase();
 
