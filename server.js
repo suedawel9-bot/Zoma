@@ -52,7 +52,14 @@ const MAX_DEPOSIT = Number(process.env.MAX_DEPOSIT || 50000);
 const MIN_DEPOSIT_FOR_WITHDRAWAL = Number(process.env.MIN_DEPOSIT_FOR_WITHDRAWAL || 100);
 
 const REFERRAL_BONUS_INVITER = Number(process.env.REFERRAL_BONUS_INVITER || 20);
-const BOT_USERNAME = String(process.env.BOT_USERNAME || "Biinnngobot").trim().replace(/^@+/, "");
+
+// Sanitize BOT_USERNAME aggressively so a dirty env var can't produce a
+// malformed invite link like https://t.me/Biinnngobot=@Biinnngobot?start=...
+const BOT_USERNAME = String(process.env.BOT_USERNAME || "Biinnngobot")
+  .trim()
+  .replace(/^https?:\/\/t\.me\//i, "")   // strip full t.me URL prefix
+  .replace(/^@+/, "")                    // strip leading @
+  .replace(/[^A-Za-z0-9_]/g, "");       // keep only valid bot username chars
 
 const TB_RECEIVER_NAME = String(process.env.TB_RECEIVER_NAME || "helen yohaness bitew").trim().toLowerCase();
 
@@ -743,7 +750,7 @@ if (ADMIN_BOT_TOKEN) {
   });
 
   bot.command("invite", async (ctx) => {
-    const uid = ctx.from.id;
+    const uid = String(ctx.from.id).replace(/\D/g, "");
     const link = `https://t.me/${BOT_USERNAME}?start=ref_${uid}`;
     const stats = await pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE referred_by = $1`, [uid]);
     const count = stats.rows[0].count;
@@ -847,7 +854,7 @@ if (ADMIN_BOT_TOKEN) {
 
   bot.callbackQuery("menu:invite", async (ctx) => {
     await ctx.answerCallbackQuery();
-    const uid = ctx.from.id;
+    const uid = String(ctx.from.id).replace(/\D/g, "");
     const link = `https://t.me/${BOT_USERNAME}?start=ref_${uid}`;
     const stats = await pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE referred_by = $1`, [uid]);
     const count = stats.rows[0].count;
@@ -1490,7 +1497,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`💸 Min deposit for withdrawal: ${MIN_DEPOSIT_FOR_WITHDRAWAL} birr`);
   console.log(`🎯 Patterns: Rows, Columns, Diagonals, Four Corners`);
   console.log(`💳 Telebirr: ${TB_NUMBER} (${TB_NAME})`);
-  console.log(`🤖 Bot username: @${BOT_USERNAME}`);
+  console.log(`🤖 Bot username (sanitized): "${BOT_USERNAME}"`);
   console.log(`🔎 Receipt: TB_RECEIVER_NAME="${TB_RECEIVER_NAME}"  AGE=unlimited`);
 
   try {
